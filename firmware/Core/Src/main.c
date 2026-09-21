@@ -1,1160 +1,600 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include <math.h>
+#include "cmsis_os.h"
 
-#define MPU6050_ADDR (0x68 << 1)
-#define MPU6050_WHO_AM_I 0x75
-#define MPU6050_PWR_MGMT_1 0x6B
-#define MPU6050_GYRO_CONFIG 0x1B
-#define MPU6050_ACCEL_CONFIG 0x1C
-#define MPU6050_ACCEL_XOUT_H 0x3B
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
 
-/* SERVO 1 */
-#define SERVO1_MIN_US 1000U
-#define SERVO1_CENTER_US 1500U   /* CHANGE TO YOUR CALIBRATED VALUE */
-#define SERVO1_MAX_US 2000U
-#define SERVO1_GAIN 12.0f
-#define SERVO1_DIRECTION (-1.0f)
+/* USER CODE END Includes */
 
-/* SERVO 2 */
-#define SERVO2_MIN_US 1000U
-#define SERVO2_CENTER_US 1500U   /* CHANGE TO YOUR CALIBRATED VALUE */
-#define SERVO2_MAX_US 2000U
-#define SERVO2_GAIN 12.0f
-#define SERVO2_DIRECTION (-1.0f)
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
 
-#define ANGLE_DEADBAND_DEG 0.3f
+/* USER CODE END PTD */
 
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
 
+TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 
-typedef struct
-{
-    I2C_HandleTypeDef *i2c;
+/* Definitions for imuTask */
+osThreadId_t imuTaskHandle;
+const osThreadAttr_t imuTask_attributes = {
+  .name = "imuTask",
+  .priority = (osPriority_t) osPriorityAboveNormal,
+  .stack_size = 256 * 4
+};
+/* Definitions for controlTask */
+osThreadId_t controlTaskHandle;
+const osThreadAttr_t controlTask_attributes = {
+  .name = "controlTask",
+  .priority = (osPriority_t) osPriorityNormal,
+  .stack_size = 256 * 4
+};
+/* USER CODE BEGIN PV */
 
-    uint8_t who_am_i;
-    uint8_t ok;
-    uint8_t filter_initialized;
+/* USER CODE END PV */
 
-    uint8_t sensor_data[14];
-
-    int16_t accel_x_raw;
-    int16_t accel_y_raw;
-    int16_t accel_z_raw;
-
-    int16_t gyro_x_raw;
-    int16_t gyro_y_raw;
-    int16_t gyro_z_raw;
-
-    float accel_x_g;
-    float accel_y_g;
-    float accel_z_g;
-
-    float gyro_x_dps;
-    float gyro_y_dps;
-    float gyro_z_dps;
-
-    float gyro_x_bias;
-    float gyro_y_bias;
-    float gyro_z_bias;
-
-    float pitch_accel_deg;
-    float roll_accel_deg;
-
-    float pitch_filtered_deg;
-    float roll_filtered_deg;
-
-    float pitch_reference_deg;
-    float roll_reference_deg;
-
-    uint32_t last_update_ms;
-
-} MPU6050_t;
-
-MPU6050_t mpu1 = {0};
-MPU6050_t mpu2 = {0};
-
-uint16_t servo1_pulse_us = SERVO1_CENTER_US;
-uint16_t servo2_pulse_us = SERVO2_CENTER_US;
-
-float servo1_relative_angle = 0.0f;
-float servo1_error = 0.0f;
-float servo1_correction = 0.0f;
-
-float servo2_relative_angle = 0.0f;
-float servo2_error = 0.0f;
-float servo2_correction = 0.0f;
-
-HAL_StatusTypeDef servo1_pwm_status;
-HAL_StatusTypeDef servo2_pwm_status;
-
+/* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_TIM4_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_TIM3_Init(void);
-static void MX_TIM4_Init(void);
+void StartImuTask(void *argument);
+void StartControlTask(void *argument);
 
-static void MPU6050_Init(MPU6050_t *mpu);
-static void MPU6050_CalibrateGyro(MPU6050_t *mpu);
-static void MPU6050_Update(MPU6050_t *mpu);
-static void MPU6050_CalibrateReference(MPU6050_t *mpu);
+/* USER CODE BEGIN PFP */
 
-static void Servo1_SetPulse(uint16_t pulse_us);
-static void Servo2_SetPulse(uint16_t pulse_us);
+/* USER CODE END PFP */
 
-static void Servo1_Stabilization_Update(void);
-static void Servo2_Stabilization_Update(void);
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
 
-static void Servo1_SetPulse(uint16_t pulse_us)
-{
-    if (pulse_us < SERVO1_MIN_US)
-    {
-        pulse_us = SERVO1_MIN_US;
-    }
+/* USER CODE END 0 */
 
-    if (pulse_us > SERVO1_MAX_US)
-    {
-        pulse_us = SERVO1_MAX_US;
-    }
-
-    servo1_pulse_us = pulse_us;
-
-    __HAL_TIM_SET_COMPARE(
-        &htim4,
-        TIM_CHANNEL_1,
-        pulse_us
-    );
-}
-
-static void Servo2_SetPulse(uint16_t pulse_us)
-{
-    if (pulse_us < SERVO2_MIN_US)
-    {
-        pulse_us = SERVO2_MIN_US;
-    }
-
-    if (pulse_us > SERVO2_MAX_US)
-    {
-        pulse_us = SERVO2_MAX_US;
-    }
-
-    servo2_pulse_us = pulse_us;
-
-    __HAL_TIM_SET_COMPARE(
-        &htim3,
-        TIM_CHANNEL_3,
-        pulse_us
-    );
-}
-
-static void Servo1_Stabilization_Update(void)
-{
-    if (!mpu1.ok || !mpu1.filter_initialized)
-    {
-        return;
-    }
-
-    /*
-     * SERVO 1 USES MPU1 PITCH.
-     */
-    servo1_relative_angle =
-        mpu1.pitch_filtered_deg -
-        mpu1.pitch_reference_deg;
-
-    servo1_error = servo1_relative_angle;
-
-    if (fabsf(servo1_error) < ANGLE_DEADBAND_DEG)
-    {
-        servo1_error = 0.0f;
-    }
-
-    servo1_correction =
-        servo1_error *
-        SERVO1_GAIN;
-
-    float command =
-        (float)SERVO1_CENTER_US +
-        (SERVO1_DIRECTION * servo1_correction);
-
-    int32_t servo_command =
-        (int32_t)command;
-
-    if (servo_command < SERVO1_MIN_US)
-    {
-        servo_command = SERVO1_MIN_US;
-    }
-
-    if (servo_command > SERVO1_MAX_US)
-    {
-        servo_command = SERVO1_MAX_US;
-    }
-
-    Servo1_SetPulse(
-        (uint16_t)servo_command
-    );
-}
-
-static void Servo2_Stabilization_Update(void)
-{
-    if (!mpu2.ok || !mpu2.filter_initialized)
-    {
-        return;
-    }
-
-    /*
-     * SERVO 2 USES MPU2 ROLL.
-     *
-     * If Servo 2 reacts to the wrong physical tilt axis,
-     * change BOTH roll_filtered_deg and roll_reference_deg
-     * below to pitch_filtered_deg and pitch_reference_deg.
-     */
-    servo2_relative_angle =
-        mpu2.roll_filtered_deg -
-        mpu2.roll_reference_deg;
-
-    servo2_error = servo2_relative_angle;
-
-    if (fabsf(servo2_error) < ANGLE_DEADBAND_DEG)
-    {
-        servo2_error = 0.0f;
-    }
-
-    servo2_correction =
-        servo2_error *
-        SERVO2_GAIN;
-
-    float command =
-        (float)SERVO2_CENTER_US +
-        (SERVO2_DIRECTION * servo2_correction);
-
-    int32_t servo_command =
-        (int32_t)command;
-
-    if (servo_command < SERVO2_MIN_US)
-    {
-        servo_command = SERVO2_MIN_US;
-    }
-
-    if (servo_command > SERVO2_MAX_US)
-    {
-        servo_command = SERVO2_MAX_US;
-    }
-
-    Servo2_SetPulse(
-        (uint16_t)servo_command
-    );
-}
-
-static void MPU6050_Init(MPU6050_t *mpu)
-{
-    uint8_t wake = 0x00;
-    uint8_t gyro_config = 0x08;
-    uint8_t accel_config = 0x00;
-
-    HAL_StatusTypeDef status;
-
-    status = HAL_I2C_Mem_Read(
-        mpu->i2c,
-        MPU6050_ADDR,
-        MPU6050_WHO_AM_I,
-        I2C_MEMADD_SIZE_8BIT,
-        &mpu->who_am_i,
-        1,
-        100
-    );
-
-    if (
-        status == HAL_OK &&
-        mpu->who_am_i == 0x68
-    )
-    {
-        mpu->ok = 1;
-    }
-    else
-    {
-        mpu->ok = 0;
-        return;
-    }
-
-    HAL_I2C_Mem_Write(
-        mpu->i2c,
-        MPU6050_ADDR,
-        MPU6050_PWR_MGMT_1,
-        I2C_MEMADD_SIZE_8BIT,
-        &wake,
-        1,
-        100
-    );
-
-    HAL_Delay(100);
-
-    HAL_I2C_Mem_Write(
-        mpu->i2c,
-        MPU6050_ADDR,
-        MPU6050_GYRO_CONFIG,
-        I2C_MEMADD_SIZE_8BIT,
-        &gyro_config,
-        1,
-        100
-    );
-
-    HAL_I2C_Mem_Write(
-        mpu->i2c,
-        MPU6050_ADDR,
-        MPU6050_ACCEL_CONFIG,
-        I2C_MEMADD_SIZE_8BIT,
-        &accel_config,
-        1,
-        100
-    );
-
-    HAL_Delay(100);
-}
-
-static void MPU6050_CalibrateGyro(MPU6050_t *mpu)
-{
-    if (!mpu->ok)
-    {
-        return;
-    }
-
-    mpu->gyro_x_bias = 0.0f;
-    mpu->gyro_y_bias = 0.0f;
-    mpu->gyro_z_bias = 0.0f;
-
-    uint16_t successful_samples = 0;
-
-    for (int i = 0; i < 200; i++)
-    {
-        HAL_StatusTypeDef status;
-
-        status = HAL_I2C_Mem_Read(
-            mpu->i2c,
-            MPU6050_ADDR,
-            MPU6050_ACCEL_XOUT_H,
-            I2C_MEMADD_SIZE_8BIT,
-            mpu->sensor_data,
-            14,
-            100
-        );
-
-        if (status == HAL_OK)
-        {
-            int16_t gx =
-                (int16_t)(
-                    (mpu->sensor_data[8] << 8) |
-                    mpu->sensor_data[9]
-                );
-
-            int16_t gy =
-                (int16_t)(
-                    (mpu->sensor_data[10] << 8) |
-                    mpu->sensor_data[11]
-                );
-
-            int16_t gz =
-                (int16_t)(
-                    (mpu->sensor_data[12] << 8) |
-                    mpu->sensor_data[13]
-                );
-
-            mpu->gyro_x_bias += gx / 65.5f;
-            mpu->gyro_y_bias += gy / 65.5f;
-            mpu->gyro_z_bias += gz / 65.5f;
-
-            successful_samples++;
-        }
-
-        HAL_Delay(5);
-    }
-
-    if (successful_samples > 0)
-    {
-        mpu->gyro_x_bias /= successful_samples;
-        mpu->gyro_y_bias /= successful_samples;
-        mpu->gyro_z_bias /= successful_samples;
-    }
-}
-
-static void MPU6050_Update(MPU6050_t *mpu)
-{
-    if (!mpu->ok)
-    {
-        return;
-    }
-
-    HAL_StatusTypeDef status;
-
-    status = HAL_I2C_Mem_Read(
-        mpu->i2c,
-        MPU6050_ADDR,
-        MPU6050_ACCEL_XOUT_H,
-        I2C_MEMADD_SIZE_8BIT,
-        mpu->sensor_data,
-        14,
-        100
-    );
-
-    if (status != HAL_OK)
-    {
-        return;
-    }
-
-    mpu->accel_x_raw =
-        (int16_t)(
-            (mpu->sensor_data[0] << 8) |
-            mpu->sensor_data[1]
-        );
-
-    mpu->accel_y_raw =
-        (int16_t)(
-            (mpu->sensor_data[2] << 8) |
-            mpu->sensor_data[3]
-        );
-
-    mpu->accel_z_raw =
-        (int16_t)(
-            (mpu->sensor_data[4] << 8) |
-            mpu->sensor_data[5]
-        );
-
-    mpu->gyro_x_raw =
-        (int16_t)(
-            (mpu->sensor_data[8] << 8) |
-            mpu->sensor_data[9]
-        );
-
-    mpu->gyro_y_raw =
-        (int16_t)(
-            (mpu->sensor_data[10] << 8) |
-            mpu->sensor_data[11]
-        );
-
-    mpu->gyro_z_raw =
-        (int16_t)(
-            (mpu->sensor_data[12] << 8) |
-            mpu->sensor_data[13]
-        );
-
-    mpu->accel_x_g =
-        mpu->accel_x_raw / 16384.0f;
-
-    mpu->accel_y_g =
-        mpu->accel_y_raw / 16384.0f;
-
-    mpu->accel_z_g =
-        mpu->accel_z_raw / 16384.0f;
-
-    mpu->gyro_x_dps =
-        (mpu->gyro_x_raw / 65.5f) -
-        mpu->gyro_x_bias;
-
-    mpu->gyro_y_dps =
-        (mpu->gyro_y_raw / 65.5f) -
-        mpu->gyro_y_bias;
-
-    mpu->gyro_z_dps =
-        (mpu->gyro_z_raw / 65.5f) -
-        mpu->gyro_z_bias;
-
-    /*
-     * Pitch.
-     */
-    mpu->pitch_accel_deg =
-        atan2f(
-            -mpu->accel_x_g,
-            sqrtf(
-                (mpu->accel_y_g * mpu->accel_y_g) +
-                (mpu->accel_z_g * mpu->accel_z_g)
-            )
-        ) * 57.29578f;
-
-    /*
-     * Roll.
-     */
-    mpu->roll_accel_deg =
-        atan2f(
-            mpu->accel_y_g,
-            sqrtf(
-                (mpu->accel_x_g * mpu->accel_x_g) +
-                (mpu->accel_z_g * mpu->accel_z_g)
-            )
-        ) * 57.29578f;
-
-    uint32_t now =
-        HAL_GetTick();
-
-    float dt = 0.005f;
-
-    if (mpu->last_update_ms != 0)
-    {
-        dt =
-            (now - mpu->last_update_ms) *
-            0.001f;
-
-        if (dt <= 0.0f || dt > 0.05f)
-        {
-            dt = 0.005f;
-        }
-    }
-
-    mpu->last_update_ms = now;
-
-    const float alpha = 0.98f;
-
-    if (!mpu->filter_initialized)
-    {
-        mpu->pitch_filtered_deg =
-            mpu->pitch_accel_deg;
-
-        mpu->roll_filtered_deg =
-            mpu->roll_accel_deg;
-
-        mpu->filter_initialized = 1;
-    }
-    else
-    {
-        mpu->pitch_filtered_deg =
-            alpha *
-            (
-                mpu->pitch_filtered_deg +
-                mpu->gyro_y_dps * dt
-            )
-            +
-            (1.0f - alpha) *
-            mpu->pitch_accel_deg;
-
-        mpu->roll_filtered_deg =
-            alpha *
-            (
-                mpu->roll_filtered_deg +
-                mpu->gyro_x_dps * dt
-            )
-            +
-            (1.0f - alpha) *
-            mpu->roll_accel_deg;
-    }
-}
-
-static void MPU6050_CalibrateReference(MPU6050_t *mpu)
-{
-    if (!mpu->ok)
-    {
-        return;
-    }
-
-    /*
-     * Let the filter settle.
-     */
-    for (int i = 0; i < 100; i++)
-    {
-        MPU6050_Update(mpu);
-        HAL_Delay(5);
-    }
-
-    float pitch_sum = 0.0f;
-    float roll_sum = 0.0f;
-
-    uint16_t samples = 0;
-
-    for (int i = 0; i < 100; i++)
-    {
-        MPU6050_Update(mpu);
-
-        if (mpu->filter_initialized)
-        {
-            pitch_sum +=
-                mpu->pitch_filtered_deg;
-
-            roll_sum +=
-                mpu->roll_filtered_deg;
-
-            samples++;
-        }
-
-        HAL_Delay(5);
-    }
-
-    if (samples > 0)
-    {
-        mpu->pitch_reference_deg =
-            pitch_sum / samples;
-
-        mpu->roll_reference_deg =
-            roll_sum / samples;
-    }
-}
-
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
-    HAL_Init();
 
-    SystemClock_Config();
+  /* USER CODE BEGIN 1 */
 
-    MX_GPIO_Init();
+  /* USER CODE END 1 */
 
-    MX_I2C1_Init();
-    MX_I2C2_Init();
+  /* MCU Configuration--------------------------------------------------------*/
 
-    MX_TIM4_Init();
-    MX_TIM3_Init();
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
 
-    /*
-     * MPU1 uses I2C1.
-     * MPU2 uses I2C2.
-     */
-    mpu1.i2c = &hi2c1;
-    mpu2.i2c = &hi2c2;
+  /* USER CODE BEGIN Init */
 
-    MPU6050_Init(&mpu1);
-    MPU6050_Init(&mpu2);
+  /* USER CODE END Init */
 
-    /*
-     * KEEP BOTH MPUS COMPLETELY STILL.
-     */
-    MPU6050_CalibrateGyro(&mpu1);
-    MPU6050_CalibrateGyro(&mpu2);
+  /* Configure the system clock */
+  SystemClock_Config();
 
-    /*
-     * Start Servo 1.
-     */
-    servo1_pwm_status =
-        HAL_TIM_PWM_Start(
-            &htim4,
-            TIM_CHANNEL_1
-        );
+  /* USER CODE BEGIN SysInit */
 
-    Servo1_SetPulse(
-        SERVO1_CENTER_US
-    );
+  /* USER CODE END SysInit */
 
-    /*
-     * Start Servo 2.
-     */
-    servo2_pwm_status =
-        HAL_TIM_PWM_Start(
-            &htim3,
-            TIM_CHANNEL_3
-        );
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_TIM1_Init();
+  MX_TIM4_Init();
+  MX_I2C2_Init();
+  MX_TIM3_Init();
+  /* USER CODE BEGIN 2 */
 
-    Servo2_SetPulse(
-        SERVO2_CENTER_US
-    );
+  /* USER CODE END 2 */
 
-    HAL_Delay(1000);
+  /* Init scheduler */
+  osKernelInitialize();
 
-    /*
-     * KEEP THE SPOON/MPUS STILL HERE.
-     *
-     * This position becomes 0 degrees.
-     */
-    MPU6050_CalibrateReference(&mpu1);
-    MPU6050_CalibrateReference(&mpu2);
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
 
-    while (1)
-    {
-        MPU6050_Update(&mpu1);
-        MPU6050_Update(&mpu2);
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
 
-        if (servo1_pwm_status == HAL_OK)
-        {
-            Servo1_Stabilization_Update();
-        }
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
 
-        if (servo2_pwm_status == HAL_OK)
-        {
-            Servo2_Stabilization_Update();
-        }
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
 
-        HAL_Delay(5);
-    }
+  /* Create the thread(s) */
+  /* creation of imuTask */
+  imuTaskHandle = osThreadNew(StartImuTask, NULL, &imuTask_attributes);
+
+  /* creation of controlTask */
+  controlTaskHandle = osThreadNew(StartControlTask, NULL, &controlTask_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
 }
 
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
 void SystemClock_Config(void)
 {
-    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-    HAL_PWREx_ControlVoltageScaling(
-        PWR_REGULATOR_VOLTAGE_SCALE1
-    );
+  /** Configure the main internal regulator output voltage
+  */
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-    RCC_OscInitStruct.OscillatorType =
-        RCC_OSCILLATORTYPE_HSI;
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
-    RCC_OscInitStruct.HSIState =
-        RCC_HSI_ON;
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-    RCC_OscInitStruct.HSICalibrationValue =
-        RCC_HSICALIBRATION_DEFAULT;
-
-    RCC_OscInitStruct.PLL.PLLState =
-        RCC_PLL_NONE;
-
-    if (
-        HAL_RCC_OscConfig(
-            &RCC_OscInitStruct
-        ) != HAL_OK
-    )
-    {
-        Error_Handler();
-    }
-
-    RCC_ClkInitStruct.ClockType =
-        RCC_CLOCKTYPE_HCLK |
-        RCC_CLOCKTYPE_SYSCLK |
-        RCC_CLOCKTYPE_PCLK1 |
-        RCC_CLOCKTYPE_PCLK2;
-
-    RCC_ClkInitStruct.SYSCLKSource =
-        RCC_SYSCLKSOURCE_HSI;
-
-    RCC_ClkInitStruct.AHBCLKDivider =
-        RCC_SYSCLK_DIV1;
-
-    RCC_ClkInitStruct.APB1CLKDivider =
-        RCC_HCLK_DIV1;
-
-    RCC_ClkInitStruct.APB2CLKDivider =
-        RCC_HCLK_DIV1;
-
-    if (
-        HAL_RCC_ClockConfig(
-            &RCC_ClkInitStruct,
-            FLASH_LATENCY_0
-        ) != HAL_OK
-    )
-    {
-        Error_Handler();
-    }
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_I2C1_Init(void)
 {
-    /*
-     * MPU1:
-     * PB7 = SDA
-     * PA15 = SCL
-     */
-    __HAL_RCC_I2C1_CLK_ENABLE();
 
-    hi2c1.Instance = I2C1;
+  /* USER CODE BEGIN I2C1_Init 0 */
 
-    hi2c1.Init.Timing =
-        0x00503D58;
+  /* USER CODE END I2C1_Init 0 */
 
-    hi2c1.Init.OwnAddress1 = 0;
+  /* USER CODE BEGIN I2C1_Init 1 */
 
-    hi2c1.Init.AddressingMode =
-        I2C_ADDRESSINGMODE_7BIT;
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x00503D58;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
-    hi2c1.Init.DualAddressMode =
-        I2C_DUALADDRESS_DISABLE;
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
-    hi2c1.Init.OwnAddress2 = 0;
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
 
-    hi2c1.Init.OwnAddress2Masks =
-        I2C_OA2_NOMASK;
+  /* USER CODE END I2C1_Init 2 */
 
-    hi2c1.Init.GeneralCallMode =
-        I2C_GENERALCALL_DISABLE;
-
-    hi2c1.Init.NoStretchMode =
-        I2C_NOSTRETCH_DISABLE;
-
-    if (HAL_I2C_Init(&hi2c1) != HAL_OK)
-    {
-        Error_Handler();
-    }
-
-    if (
-        HAL_I2CEx_ConfigAnalogFilter(
-            &hi2c1,
-            I2C_ANALOGFILTER_ENABLE
-        ) != HAL_OK
-    )
-    {
-        Error_Handler();
-    }
-
-    if (
-        HAL_I2CEx_ConfigDigitalFilter(
-            &hi2c1,
-            0
-        ) != HAL_OK
-    )
-    {
-        Error_Handler();
-    }
 }
 
+/**
+  * @brief I2C2 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_I2C2_Init(void)
 {
-    /*
-     * MPU2:
-     * PA8 = SDA
-     * PA9 = SCL
-     */
-    __HAL_RCC_I2C2_CLK_ENABLE();
 
-    hi2c2.Instance = I2C2;
+  /* USER CODE BEGIN I2C2_Init 0 */
 
-    hi2c2.Init.Timing =
-        0x00503D58;
+  /* USER CODE END I2C2_Init 0 */
 
-    hi2c2.Init.OwnAddress1 = 0;
+  /* USER CODE BEGIN I2C2_Init 1 */
 
-    hi2c2.Init.AddressingMode =
-        I2C_ADDRESSINGMODE_7BIT;
+  /* USER CODE END I2C2_Init 1 */
+  hi2c2.Instance = I2C2;
+  hi2c2.Init.Timing = 0x00503D58;
+  hi2c2.Init.OwnAddress1 = 0;
+  hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c2.Init.OwnAddress2 = 0;
+  hi2c2.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c2) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
-    hi2c2.Init.DualAddressMode =
-        I2C_DUALADDRESS_DISABLE;
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c2, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
-    hi2c2.Init.OwnAddress2 = 0;
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c2, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C2_Init 2 */
 
-    hi2c2.Init.OwnAddress2Masks =
-        I2C_OA2_NOMASK;
+  /* USER CODE END I2C2_Init 2 */
 
-    hi2c2.Init.GeneralCallMode =
-        I2C_GENERALCALL_DISABLE;
-
-    hi2c2.Init.NoStretchMode =
-        I2C_NOSTRETCH_DISABLE;
-
-    if (HAL_I2C_Init(&hi2c2) != HAL_OK)
-    {
-        Error_Handler();
-    }
-
-    if (
-        HAL_I2CEx_ConfigAnalogFilter(
-            &hi2c2,
-            I2C_ANALOGFILTER_ENABLE
-        ) != HAL_OK
-    )
-    {
-        Error_Handler();
-    }
-
-    if (
-        HAL_I2CEx_ConfigDigitalFilter(
-            &hi2c2,
-            0
-        ) != HAL_OK
-    )
-    {
-        Error_Handler();
-    }
 }
 
-static void MX_TIM4_Init(void)
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
 {
-    TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-    TIM_MasterConfigTypeDef sMasterConfig = {0};
-    TIM_OC_InitTypeDef sConfigOC = {0};
 
-    __HAL_RCC_TIM4_CLK_ENABLE();
+  /* USER CODE BEGIN TIM1_Init 0 */
 
-    htim4.Instance = TIM4;
-    htim4.Init.Prescaler = 15;
-    htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-    htim4.Init.Period = 19999;
-    htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-    htim4.Init.AutoReloadPreload =
-        TIM_AUTORELOAD_PRELOAD_DISABLE;
+  /* USER CODE END TIM1_Init 0 */
 
-    if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
-    {
-        Error_Handler();
-    }
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-    sClockSourceConfig.ClockSource =
-        TIM_CLOCKSOURCE_INTERNAL;
+  /* USER CODE BEGIN TIM1_Init 1 */
 
-    if (
-        HAL_TIM_ConfigClockSource(
-            &htim4,
-            &sClockSourceConfig
-        ) != HAL_OK
-    )
-    {
-        Error_Handler();
-    }
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 65535;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
 
-    if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
-    {
-        Error_Handler();
-    }
+  /* USER CODE END TIM1_Init 2 */
 
-    sMasterConfig.MasterOutputTrigger =
-        TIM_TRGO_RESET;
-
-    sMasterConfig.MasterSlaveMode =
-        TIM_MASTERSLAVEMODE_DISABLE;
-
-    if (
-        HAL_TIMEx_MasterConfigSynchronization(
-            &htim4,
-            &sMasterConfig
-        ) != HAL_OK
-    )
-    {
-        Error_Handler();
-    }
-
-    sConfigOC.OCMode =
-        TIM_OCMODE_PWM1;
-
-    sConfigOC.Pulse =
-        SERVO1_CENTER_US;
-
-    sConfigOC.OCPolarity =
-        TIM_OCPOLARITY_HIGH;
-
-    sConfigOC.OCFastMode =
-        TIM_OCFAST_DISABLE;
-
-    if (
-        HAL_TIM_PWM_ConfigChannel(
-            &htim4,
-            &sConfigOC,
-            TIM_CHANNEL_1
-        ) != HAL_OK
-    )
-    {
-        Error_Handler();
-    }
 }
 
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_TIM3_Init(void)
 {
-    TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-    TIM_MasterConfigTypeDef sMasterConfig = {0};
-    TIM_OC_InitTypeDef sConfigOC = {0};
 
-    __HAL_RCC_TIM3_CLK_ENABLE();
+  /* USER CODE BEGIN TIM3_Init 0 */
 
-    htim3.Instance = TIM3;
-    htim3.Init.Prescaler = 15;
-    htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-    htim3.Init.Period = 19999;
-    htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-    htim3.Init.AutoReloadPreload =
-        TIM_AUTORELOAD_PRELOAD_DISABLE;
+  /* USER CODE END TIM3_Init 0 */
 
-    if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
-    {
-        Error_Handler();
-    }
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
 
-    sClockSourceConfig.ClockSource =
-        TIM_CLOCKSOURCE_INTERNAL;
+  /* USER CODE BEGIN TIM3_Init 1 */
 
-    if (
-        HAL_TIM_ConfigClockSource(
-            &htim3,
-            &sClockSourceConfig
-        ) != HAL_OK
-    )
-    {
-        Error_Handler();
-    }
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 15;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 19999;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 1500;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
 
-    if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
-    {
-        Error_Handler();
-    }
+  /* USER CODE END TIM3_Init 2 */
+  HAL_TIM_MspPostInit(&htim3);
 
-    sMasterConfig.MasterOutputTrigger =
-        TIM_TRGO_RESET;
-
-    sMasterConfig.MasterSlaveMode =
-        TIM_MASTERSLAVEMODE_DISABLE;
-
-    if (
-        HAL_TIMEx_MasterConfigSynchronization(
-            &htim3,
-            &sMasterConfig
-        ) != HAL_OK
-    )
-    {
-        Error_Handler();
-    }
-
-    sConfigOC.OCMode =
-        TIM_OCMODE_PWM1;
-
-    sConfigOC.Pulse =
-        SERVO2_CENTER_US;
-
-    sConfigOC.OCPolarity =
-        TIM_OCPOLARITY_HIGH;
-
-    sConfigOC.OCFastMode =
-        TIM_OCFAST_DISABLE;
-
-    if (
-        HAL_TIM_PWM_ConfigChannel(
-            &htim3,
-            &sConfigOC,
-            TIM_CHANNEL_3
-        ) != HAL_OK
-    )
-    {
-        Error_Handler();
-    }
 }
 
+/**
+  * @brief TIM4 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM4_Init(void)
+{
+
+  /* USER CODE BEGIN TIM4_Init 0 */
+
+  /* USER CODE END TIM4_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM4_Init 1 */
+
+  /* USER CODE END TIM4_Init 1 */
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 15;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 19999;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim4, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 1500;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM4_Init 2 */
+
+  /* USER CODE END TIM4_Init 2 */
+  HAL_TIM_MspPostInit(&htim4);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_GPIO_Init(void)
 {
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
 
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-    __HAL_RCC_GPIOB_CLK_ENABLE();
+  /* USER CODE END MX_GPIO_Init_1 */
 
-    /*
-     * MPU1 I2C1
-     * PB7 = SDA
-     */
-    GPIO_InitStruct.Pin =
-        GPIO_PIN_7;
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
 
-    GPIO_InitStruct.Mode =
-        GPIO_MODE_AF_OD;
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
 
-    GPIO_InitStruct.Pull =
-        GPIO_NOPULL;
+  /*Configure GPIO pin : PB8 */
+  GPIO_InitStruct.Pin = GPIO_PIN_8;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-    GPIO_InitStruct.Speed =
-        GPIO_SPEED_FREQ_LOW;
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
 
-    GPIO_InitStruct.Alternate =
-        GPIO_AF4_I2C1;
-
-    HAL_GPIO_Init(
-        GPIOB,
-        &GPIO_InitStruct
-    );
-
-    /*
-     * MPU1 I2C1
-     * PA15 = SCL
-     */
-    GPIO_InitStruct.Pin =
-        GPIO_PIN_15;
-
-    GPIO_InitStruct.Mode =
-        GPIO_MODE_AF_OD;
-
-    GPIO_InitStruct.Pull =
-        GPIO_NOPULL;
-
-    GPIO_InitStruct.Speed =
-        GPIO_SPEED_FREQ_LOW;
-
-    GPIO_InitStruct.Alternate =
-        GPIO_AF4_I2C1;
-
-    HAL_GPIO_Init(
-        GPIOA,
-        &GPIO_InitStruct
-    );
-
-    /*
-     * MPU2 I2C2
-     * PA8 = SDA
-     * PA9 = SCL
-     */
-    GPIO_InitStruct.Pin =
-        GPIO_PIN_8 |
-        GPIO_PIN_9;
-
-    GPIO_InitStruct.Mode =
-        GPIO_MODE_AF_OD;
-
-    GPIO_InitStruct.Pull =
-        GPIO_NOPULL;
-
-    GPIO_InitStruct.Speed =
-        GPIO_SPEED_FREQ_LOW;
-
-    GPIO_InitStruct.Alternate =
-        GPIO_AF4_I2C2;
-
-    HAL_GPIO_Init(
-        GPIOA,
-        &GPIO_InitStruct
-    );
-
-    /*
-     * SERVO1
-     * PB6 = TIM4_CH1
-     */
-    GPIO_InitStruct.Pin =
-        GPIO_PIN_6;
-
-    GPIO_InitStruct.Mode =
-        GPIO_MODE_AF_PP;
-
-    GPIO_InitStruct.Pull =
-        GPIO_NOPULL;
-
-    GPIO_InitStruct.Speed =
-        GPIO_SPEED_FREQ_LOW;
-
-    GPIO_InitStruct.Alternate =
-        GPIO_AF2_TIM4;
-
-    HAL_GPIO_Init(
-        GPIOB,
-        &GPIO_InitStruct
-    );
-
-    /*
-     * SERVO2
-     * PB0 = TIM3_CH3
-     */
-    GPIO_InitStruct.Pin =
-        GPIO_PIN_0;
-
-    GPIO_InitStruct.Mode =
-        GPIO_MODE_AF_PP;
-
-    GPIO_InitStruct.Pull =
-        GPIO_NOPULL;
-
-    GPIO_InitStruct.Speed =
-        GPIO_SPEED_FREQ_LOW;
-
-    GPIO_InitStruct.Alternate =
-        GPIO_AF2_TIM3;
-
-    HAL_GPIO_Init(
-        GPIOB,
-        &GPIO_InitStruct
-    );
+  /* USER CODE END MX_GPIO_Init_2 */
 }
 
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartImuTask */
+/**
+  * @brief  Function implementing the imuTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartImuTask */
+void StartImuTask(void *argument)
+{
+  /* USER CODE BEGIN 5 */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_StartControlTask */
+/**
+* @brief Function implementing the controlTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartControlTask */
+void StartControlTask(void *argument)
+{
+  /* USER CODE BEGIN StartControlTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartControlTask */
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM6 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
 void Error_Handler(void)
 {
-    __disable_irq();
-
-    while (1)
-    {
-    }
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
 }
-
 #ifdef USE_FULL_ASSERT
-
-void assert_failed(
-    uint8_t *file,
-    uint32_t line
-)
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
 {
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
 }
-
-#endif
+#endif /* USE_FULL_ASSERT */
