@@ -1194,6 +1194,7 @@ int main(void)
     /*
      * Initialize FreeRTOS.
      */
+
     osKernelInitialize();
 
 
@@ -1828,6 +1829,13 @@ static void MX_GPIO_Init(void)
 /* ============================================================
  * ERROR HANDLER
  * ============================================================ */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM6)
+    {
+        HAL_IncTick();
+    }
+}
 
 void Error_Handler(void)
 {
