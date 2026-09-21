@@ -1,0 +1,14 @@
+STEADYHAND V3.9 - DIRECT SCREWS FOR THE SPOON CARRIAGE
+
+REPRINT ONLY THIS PART FOR THE SCREW-HOLE FIX:
+  V3_9_integrated_moving_carriage.stl
+
+The two spoon-carriage attachment holes are now 2.6 mm pilots. Use two ordinary
+M3 x 10 mm machine screws. Pass each screw through the existing pitch-horn
+adapter, then slowly screw it directly into the new carriage. Stop when snug.
+No heat-set inserts or nuts are needed at this connection.
+
+The existing V3.8 pitch-horn adapter, handle tray, lid, and outer frame remain
+compatible. Do not reprint them solely for this change.
+
+Do not print files beginning with REFERENCE.
