@@ -15,16 +15,25 @@
 #define MPU6050_WHO_AM_I          0x75
 
 #define MPU6050_PWR_MGMT_1        0x6B
+
 #define MPU6050_CONFIG            0x1A
+
 #define MPU6050_GYRO_CONFIG       0x1B
+
 #define MPU6050_ACCEL_CONFIG      0x1C
+
 #define MPU6050_ACCEL_XOUT_H      0x3B
 
 /*
+
  * DLPF_CFG = 3
+
  * Accelerometer bandwidth is about 44 Hz.
+
  * Gyroscope bandwidth is about 42 Hz.
+
  */
+
 #define MPU6050_DLPF_CONFIG       0x03
 
 /* ============================================================
@@ -55,7 +64,7 @@
 
 #define SERVO2_MAX_US             2000U
 
-#define SERVO2_GAIN               12.0f
+#define SERVO2_GAIN               3.0f
 
 /*
 
@@ -70,6 +79,7 @@
 #define ANGLE_DEADBAND_DEG        0.3f
 
 /* Maximum PWM movement allowed during one 10 ms control cycle. */
+
 #define MAX_SERVO_STEP_US         30U
 
 /* ============================================================
@@ -561,16 +571,23 @@ static void Servo1_Stabilization_Update(void)
     }
 
     uint16_t servo_target =
+
         (uint16_t)servo_command;
 
     uint16_t servo_limited =
+
         Servo_LimitStep(
+
             servo1_pulse_us,
+
             servo_target
+
         );
 
     Servo1_SetPulse(
+
         servo_limited
+
     );
 
 }
@@ -682,7 +699,9 @@ static void Servo2_Stabilization_Update(void)
     }
 
     Servo2_SetPulse(
+
         (uint16_t)servo_command
+
     );
 
 }
@@ -702,104 +721,177 @@ static void MPU6050_Init(
 {
 
     uint8_t wake = 0x00;
+
     uint8_t gyro_config = 0x08;   /* +/-500 deg/s */
+
     uint8_t accel_config = 0x00;  /* +/-2g */
+
     uint8_t dlpf_config = MPU6050_DLPF_CONFIG;
 
     HAL_StatusTypeDef status;
 
     /* Check MPU identity. */
+
     status = HAL_I2C_Mem_Read(
+
         mpu->i2c,
+
         MPU6050_ADDR,
+
         MPU6050_WHO_AM_I,
+
         I2C_MEMADD_SIZE_8BIT,
+
         &mpu->who_am_i,
+
         1,
+
         100
+
     );
 
     if (status == HAL_OK && mpu->who_am_i == 0x68)
+
     {
+
         mpu->ok = 1;
+
     }
+
     else
+
     {
+
         mpu->ok = 0;
+
         return;
+
     }
 
     /* Wake MPU6050. */
+
     status = HAL_I2C_Mem_Write(
+
         mpu->i2c,
+
         MPU6050_ADDR,
+
         MPU6050_PWR_MGMT_1,
+
         I2C_MEMADD_SIZE_8BIT,
+
         &wake,
+
         1,
+
         100
+
     );
 
     if (status != HAL_OK)
+
     {
+
         mpu->ok = 0;
+
         return;
+
     }
 
     HAL_Delay(100);
 
     /* Configure the MPU6050 hardware digital low pass filter. */
+
     status = HAL_I2C_Mem_Write(
+
         mpu->i2c,
+
         MPU6050_ADDR,
+
         MPU6050_CONFIG,
+
         I2C_MEMADD_SIZE_8BIT,
+
         &dlpf_config,
+
         1,
+
         100
+
     );
 
     if (status != HAL_OK)
+
     {
+
         mpu->ok = 0;
+
         return;
+
     }
 
     /* Configure gyroscope. */
+
     status = HAL_I2C_Mem_Write(
+
         mpu->i2c,
+
         MPU6050_ADDR,
+
         MPU6050_GYRO_CONFIG,
+
         I2C_MEMADD_SIZE_8BIT,
+
         &gyro_config,
+
         1,
+
         100
+
     );
 
     if (status != HAL_OK)
+
     {
+
         mpu->ok = 0;
+
         return;
+
     }
 
     /* Configure accelerometer. */
+
     status = HAL_I2C_Mem_Write(
+
         mpu->i2c,
+
         MPU6050_ADDR,
+
         MPU6050_ACCEL_CONFIG,
+
         I2C_MEMADD_SIZE_8BIT,
+
         &accel_config,
+
         1,
+
         100
+
     );
 
     if (status != HAL_OK)
+
     {
+
         mpu->ok = 0;
+
         return;
+
     }
 
     HAL_Delay(100);
+
 }
 
 /* ============================================================
@@ -1537,15 +1629,21 @@ void App_IMU_TaskStep(void)
  * ============================================================ */
 
 void App_Control_TaskStep(void)
+
 {
-    if (servo1_pwm_status == HAL_OK)
+
+    Servo1_SetPulse(SERVO1_CENTER_US);
+
+    if (servo2_pwm_status == HAL_OK)
+
     {
-        Servo1_Stabilization_Update();
+
+        Servo2_Stabilization_Update();
+
     }
 
-    Servo2_SetPulse(SERVO2_CENTER_US);
-
     control_task_count++;
+
 }
 
 /* ============================================================
