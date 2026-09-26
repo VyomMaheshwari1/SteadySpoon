@@ -64,7 +64,11 @@
 
 #define SERVO2_MAX_US             2000U
 
-#define SERVO2_GAIN               5.0f
+#define SERVO2_OUTER_GAIN         0.45f
+#define SERVO2_MAX_STEP_US        8.0f
+#define SERVO2_DEADBAND_DEG       0.4f
+#define SERVO2_SAFE_MIN_US        1150.0f
+#define SERVO2_SAFE_MAX_US        1850.0f
 
 /*
 
@@ -197,6 +201,9 @@ volatile float servo2_relative_angle = 0.0f;
 volatile float servo2_error = 0.0f;
 
 volatile float servo2_correction = 0.0f;
+volatile float servo2_command_us_f = 1500.0f;
+volatile float servo2_measured_roll_deg = 0.0f;
+volatile float servo2_reference_roll_deg = 0.0f;
 
 HAL_StatusTypeDef servo1_pwm_status;
 
@@ -603,107 +610,106 @@ static void Servo1_Stabilization_Update(void)
  * ============================================================ */
 
 static void Servo2_Stabilization_Update(void)
-
 {
+    static uint8_t command_initialized = 0U;
 
     if (
-
         !mpu2.ok ||
-
         !mpu2.filter_initialized
-
     )
-
     {
-
         return;
-
     }
 
-    servo2_relative_angle =
+    /*
+     * MPU2 is mounted on the SPOON CARRIAGE.
+     * Therefore MPU2 directly measures the quantity we want to hold:
+     * the spoon carriage's world roll angle.
+     */
+    servo2_measured_roll_deg =
+        mpu2.roll_filtered_deg;
 
-        mpu2.roll_filtered_deg -
-
+    servo2_reference_roll_deg =
         mpu2.roll_reference_deg;
 
-    servo2_error =
+    servo2_relative_angle =
+        servo2_measured_roll_deg -
+        servo2_reference_roll_deg;
 
+    servo2_error =
         servo2_relative_angle;
 
-    if (
-
-        fabsf(servo2_error) <
-
-        ANGLE_DEADBAND_DEG
-
-    )
-
+    /*
+     * Initialize the floating-point command from the real PWM once.
+     * IMPORTANT: keep this command as FLOAT so sub-microsecond corrections
+     * accumulate instead of being lost when uint16_t PWM values are used.
+     */
+    if (!command_initialized)
     {
+        servo2_command_us_f =
+            (float)servo2_pulse_us;
 
-        servo2_error = 0.0f;
+        command_initialized = 1U;
+    }
 
+    /*
+     * Close enough to level: hold the CURRENT servo command.
+     * Do not return to 1500 us.
+     */
+    if (fabsf(servo2_error) <= SERVO2_DEADBAND_DEG)
+    {
+        servo2_correction = 0.0f;
+
+        Servo2_SetPulse(
+            (uint16_t)(servo2_command_us_f + 0.5f)
+        );
+
+        return;
+    }
+
+    /*
+     * Outer-loop carriage stabilization.
+     *
+     * The servo is already an internal position-control system.
+     * Our outer loop nudges its requested position until the MPU on
+     * the carriage reports that the spoon is back at its startup angle.
+     */
+    float step_us =
+        SERVO2_OUTER_GAIN *
+        servo2_error;
+
+    if (step_us > SERVO2_MAX_STEP_US)
+    {
+        step_us = SERVO2_MAX_STEP_US;
+    }
+
+    if (step_us < -SERVO2_MAX_STEP_US)
+    {
+        step_us = -SERVO2_MAX_STEP_US;
     }
 
     servo2_correction =
+        step_us;
 
-        servo2_error *
+    servo2_command_us_f +=
+        SERVO2_DIRECTION *
+        step_us;
 
-        SERVO2_GAIN;
-
-    float command =
-
-        (float)SERVO2_CENTER_US +
-
-        (
-
-            SERVO2_DIRECTION *
-
-            servo2_correction
-
-        );
-
-    int32_t servo_command =
-
-        (int32_t)command;
-
-    if (
-
-        servo_command <
-
-        (int32_t)SERVO2_MIN_US
-
-    )
-
+    if (servo2_command_us_f < SERVO2_SAFE_MIN_US)
     {
-
-        servo_command =
-
-            SERVO2_MIN_US;
-
+        servo2_command_us_f =
+            SERVO2_SAFE_MIN_US;
     }
 
-    if (
-
-        servo_command >
-
-        (int32_t)SERVO2_MAX_US
-
-    )
-
+    if (servo2_command_us_f > SERVO2_SAFE_MAX_US)
     {
-
-        servo_command =
-
-            SERVO2_MAX_US;
-
+        servo2_command_us_f =
+            SERVO2_SAFE_MAX_US;
     }
 
     Servo2_SetPulse(
-
-        (uint16_t)servo_command
-
+        (uint16_t)(servo2_command_us_f + 0.5f)
     );
-
 }
 
 /* ============================================================
