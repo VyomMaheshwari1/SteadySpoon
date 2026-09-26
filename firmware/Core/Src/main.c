@@ -64,7 +64,7 @@
 
 #define SERVO2_MAX_US             2000U
 
-#define SERVO2_GAIN               3.0f
+#define SERVO2_GAIN               5.0f
 
 /*
 
@@ -1629,21 +1629,21 @@ void App_IMU_TaskStep(void)
  * ============================================================ */
 
 void App_Control_TaskStep(void)
-
 {
-
+    /*
+     * Servo 1 is held at center while Servo 2 is tuned.
+     */
     Servo1_SetPulse(SERVO1_CENTER_US);
 
+    /*
+     * Real Servo 2 stabilization is active.
+     */
     if (servo2_pwm_status == HAL_OK)
-
     {
-
         Servo2_Stabilization_Update();
-
     }
 
     control_task_count++;
-
 }
 
 /* ============================================================
