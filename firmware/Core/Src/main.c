@@ -64,9 +64,11 @@
 
 #define SERVO2_MAX_US             2000U
 
-#define SERVO2_OUTER_GAIN         0.45f
-#define SERVO2_MAX_STEP_US        8.0f
-#define SERVO2_DEADBAND_DEG       0.4f
+#define SERVO2_GAIN               7.5f /* Controlled P-only trial; previous gain 5.0f. */
+#define SERVO2_MAX_SAMPLE_AGE_MS  20U
+#define SERVO2_KI_US_PER_DEG_S    2.0f /* Initial bench setting, not a validated tune. */
+#define SERVO2_I_RATE_US_PER_S   20.0f
+#define SERVO2_I_LIMIT_US        350.0f
 #define SERVO2_SAFE_MIN_US        1150.0f
 #define SERVO2_SAFE_MAX_US        1850.0f
 
@@ -163,6 +165,11 @@ typedef struct
     float roll_reference_deg;
 
     uint32_t last_update_ms;
+    HAL_StatusTypeDef read_status;
+    uint32_t read_count;
+    uint32_t read_failures;
+    uint16_t gyro_samples;
+    uint16_t reference_samples;
 
 } MPU6050_t;
 
@@ -202,12 +209,31 @@ volatile float servo2_error = 0.0f;
 
 volatile float servo2_correction = 0.0f;
 volatile float servo2_command_us_f = 1500.0f;
+/* Diagnostic baseline: 1 holds Servo 2 at center; 0 enables existing PI.
+ * This build starts with PI enabled for the secured-motor retest. */
+volatile uint32_t servo2_hold_center_test = 0U;
+volatile float servo2_integral_us = 0.0f; /* Signed PWM offset, retained near zero error. */
+volatile float servo2_p_term_us = 0.0f;
+volatile float servo2_control_dt_s = 0.0f;
 volatile float servo2_measured_roll_deg = 0.0f;
 volatile float servo2_reference_roll_deg = 0.0f;
+volatile float mpu2_accel_roll_deg, mpu2_gyro_x_dps, mpu2_pitch_deg;
+/* Handle measurements only: do not feed MPU1 into Servo 2 control. */
+volatile float mpu1_relative_roll_deg, mpu1_relative_pitch_deg;
+volatile float mpu1_gyro_x_dps, mpu1_gyro_y_dps, mpu1_gyro_z_dps;
+volatile uint32_t mpu1_valid, mpu1_sample_age_ms, mpu1_read_count;
+volatile uint32_t mpu1_read_failures, mpu1_who_am_i;
+volatile HAL_StatusTypeDef mpu1_read_status;
+volatile uint32_t mpu2_read_count, mpu2_read_failures, mpu2_sample_age_ms;
+volatile uint32_t mpu2_i2c_error, mpu2_who_am_i, mpu2_ok;
+volatile uint32_t mpu2_gyro_samples, mpu2_reference_samples;
+volatile HAL_StatusTypeDef mpu2_read_status;
+volatile uint32_t servo2_inhibit = 1U, servo2_saturated, servo2_ccr3;
+volatile uint32_t imu_step_ms, control_period_ms;
 
-HAL_StatusTypeDef servo1_pwm_status;
+volatile HAL_StatusTypeDef servo1_pwm_status;
 
-HAL_StatusTypeDef servo2_pwm_status;
+volatile HAL_StatusTypeDef servo2_pwm_status;
 
 /*
 
@@ -277,7 +303,7 @@ static void MPU6050_CalibrateGyro(
 
 );
 
-static void MPU6050_Update(
+static uint8_t MPU6050_Update(
 
     MPU6050_t *mpu
 
@@ -611,105 +637,112 @@ static void Servo1_Stabilization_Update(void)
 
 static void Servo2_Stabilization_Update(void)
 {
-    static uint8_t command_initialized = 0U;
+    static uint32_t previous_ms, previous_sample;
+    static uint8_t previous_valid;
+    uint32_t now = HAL_GetTick();
+    uint32_t elapsed_ms = now - previous_ms;
+    previous_ms = now;
+    servo2_control_dt_s = 0.0f;
+    /* Snapshot while the IMU task cannot preempt us; do not lock over I2C. */
+    int32_t lock = osKernelLock();
+    mpu1_relative_roll_deg = mpu1.roll_filtered_deg - mpu1.roll_reference_deg;
+    mpu1_relative_pitch_deg = mpu1.pitch_filtered_deg - mpu1.pitch_reference_deg;
+    mpu1_gyro_x_dps = mpu1.gyro_x_dps;
+    mpu1_gyro_y_dps = mpu1.gyro_y_dps;
+    mpu1_gyro_z_dps = mpu1.gyro_z_dps;
+    mpu1_sample_age_ms = HAL_GetTick() - mpu1.last_update_ms;
+    mpu1_read_count = mpu1.read_count;
+    mpu1_read_failures = mpu1.read_failures;
+    mpu1_read_status = mpu1.read_status;
+    mpu1_who_am_i = mpu1.who_am_i;
+    mpu1_valid = mpu1.ok && mpu1.filter_initialized &&
+        mpu1.gyro_samples == 200U && mpu1.reference_samples == 100U &&
+        mpu1.read_status == HAL_OK && mpu1.read_count != 0U &&
+        mpu1_sample_age_ms <= SERVO2_MAX_SAMPLE_AGE_MS &&
+        isfinite(mpu1_relative_roll_deg) && isfinite(mpu1_relative_pitch_deg) &&
+        isfinite(mpu1_gyro_x_dps) && isfinite(mpu1_gyro_y_dps) &&
+        isfinite(mpu1_gyro_z_dps);
+    servo2_measured_roll_deg = mpu2.roll_filtered_deg;
+    servo2_reference_roll_deg = mpu2.roll_reference_deg;
+    mpu2_accel_roll_deg = mpu2.roll_accel_deg;
+    mpu2_gyro_x_dps = mpu2.gyro_x_dps;
+    mpu2_pitch_deg = mpu2.pitch_filtered_deg;
+    mpu2_sample_age_ms = HAL_GetTick() - mpu2.last_update_ms;
+    mpu2_read_status = mpu2.read_status;
+    mpu2_read_count = mpu2.read_count;
+    mpu2_read_failures = mpu2.read_failures;
+    mpu2_i2c_error = hi2c2.ErrorCode;
+    mpu2_who_am_i = mpu2.who_am_i;
+    mpu2_ok = mpu2.ok;
+    mpu2_gyro_samples = mpu2.gyro_samples;
+    mpu2_reference_samples = mpu2.reference_samples;
+    servo2_inhibit = !mpu2.ok || !mpu2.filter_initialized ||
+        mpu2.gyro_samples != 200U || mpu2.reference_samples != 100U ||
+        mpu2.read_status != HAL_OK || mpu2.read_count == 0U ||
+        mpu2_sample_age_ms > SERVO2_MAX_SAMPLE_AGE_MS;
+    if (lock >= 0) { osKernelRestoreLock(lock); }
 
-    if (
-        !mpu2.ok ||
-        !mpu2.filter_initialized
-    )
+    servo2_relative_angle = servo2_measured_roll_deg - servo2_reference_roll_deg;
+    servo2_error = servo2_relative_angle;
+    servo2_saturated = 0U;
+    if (!isfinite(servo2_error)) { servo2_inhibit = 1U; }
+    if (servo2_hold_center_test)
     {
-        return;
-    }
-
-    /*
-     * MPU2 is mounted on the SPOON CARRIAGE.
-     * Therefore MPU2 directly measures the quantity we want to hold:
-     * the spoon carriage's world roll angle.
-     */
-    servo2_measured_roll_deg =
-        mpu2.roll_filtered_deg;
-
-    servo2_reference_roll_deg =
-        mpu2.roll_reference_deg;
-
-    servo2_relative_angle =
-        servo2_measured_roll_deg -
-        servo2_reference_roll_deg;
-
-    servo2_error =
-        servo2_relative_angle;
-
-    /*
-     * Initialize the floating-point command from the real PWM once.
-     * IMPORTANT: keep this command as FLOAT so sub-microsecond corrections
-     * accumulate instead of being lost when uint16_t PWM values are used.
-     */
-    if (!command_initialized)
-    {
-        servo2_command_us_f =
-            (float)servo2_pulse_us;
-
-        command_initialized = 1U;
-    }
-
-    /*
-     * Close enough to level: hold the CURRENT servo command.
-     * Do not return to 1500 us.
-     */
-    if (fabsf(servo2_error) <= SERVO2_DEADBAND_DEG)
-    {
+        /* Keep sensing/logging active, but remove feedback action for comparison. */
+        previous_valid = 0U;
+        servo2_integral_us = 0.0f;
+        servo2_p_term_us = 0.0f;
         servo2_correction = 0.0f;
-
-        Servo2_SetPulse(
-            (uint16_t)(servo2_command_us_f + 0.5f)
-        );
-
+        servo2_command_us_f = (float)SERVO2_CENTER_US;
+        Servo2_SetPulse(SERVO2_CENTER_US);
         return;
     }
-
-    /*
-     * Outer-loop carriage stabilization.
-     *
-     * The servo is already an internal position-control system.
-     * Our outer loop nudges its requested position until the MPU on
-     * the carriage reports that the spoon is back at its startup angle.
-     */
-    float step_us =
-        SERVO2_OUTER_GAIN *
-        servo2_error;
-
-    if (step_us > SERVO2_MAX_STEP_US)
+    if (servo2_inhibit)
     {
-        step_us = SERVO2_MAX_STEP_US;
+        /* Hold the last pulse, not an invented correction from stale data. */
+        servo2_correction = 0.0f;
+        previous_valid = 0U;
+        return;
     }
-
-    if (step_us < -SERVO2_MAX_STEP_US)
+    if (fabsf(servo2_error) < ANGLE_DEADBAND_DEG) { servo2_error = 0.0f; }
+    servo2_correction = SERVO2_GAIN * servo2_error;
+    servo2_p_term_us = SERVO2_DIRECTION * servo2_correction;
+    /* Integrate only a fresh sample over a normal control interval.
+     * Never catch up across startup, a sensor fault, or a scheduling gap. */
+    if (previous_valid && elapsed_ms > 0U && elapsed_ms <= 20U &&
+        mpu2_read_count != previous_sample)
     {
-        step_us = -SERVO2_MAX_STEP_US;
+        servo2_control_dt_s = (float)elapsed_ms * 0.001f;
+        float rate = SERVO2_DIRECTION * SERVO2_KI_US_PER_DEG_S * servo2_error;
+        if (rate > SERVO2_I_RATE_US_PER_S) { rate = SERVO2_I_RATE_US_PER_S; }
+        if (rate < -SERVO2_I_RATE_US_PER_S) { rate = -SERVO2_I_RATE_US_PER_S; }
+        float delta = rate * servo2_control_dt_s;
+        float candidate = servo2_integral_us + delta;
+        if (candidate > SERVO2_I_LIMIT_US) { candidate = SERVO2_I_LIMIT_US; }
+        if (candidate < -SERVO2_I_LIMIT_US) { candidate = -SERVO2_I_LIMIT_US; }
+        float proposed = (float)SERVO2_CENTER_US + servo2_p_term_us + candidate;
+        /* Reject accumulation further into saturation; allow unwinding. */
+        if (!((proposed > SERVO2_SAFE_MAX_US && delta > 0.0f) ||
+              (proposed < SERVO2_SAFE_MIN_US && delta < 0.0f)))
+        {
+            servo2_integral_us = candidate;
+        }
     }
-
-    servo2_correction =
-        step_us;
-
-    servo2_command_us_f +=
-        SERVO2_DIRECTION *
-        step_us;
-
+    previous_valid = 1U;
+    previous_sample = mpu2_read_count;
+    servo2_command_us_f = (float)SERVO2_CENTER_US +
+                          servo2_p_term_us + servo2_integral_us;
     if (servo2_command_us_f < SERVO2_SAFE_MIN_US)
     {
-        servo2_command_us_f =
-            SERVO2_SAFE_MIN_US;
+        servo2_command_us_f = SERVO2_SAFE_MIN_US;
+        servo2_saturated = 1U;
     }
-
     if (servo2_command_us_f > SERVO2_SAFE_MAX_US)
     {
-        servo2_command_us_f =
-            SERVO2_SAFE_MAX_US;
+        servo2_command_us_f = SERVO2_SAFE_MAX_US;
+        servo2_saturated = 1U;
     }
-
-    Servo2_SetPulse(
-        (uint16_t)(servo2_command_us_f + 0.5f)
-    );
+    Servo2_SetPulse((uint16_t)(servo2_command_us_f + 0.5f));
 }
 
 /* ============================================================
@@ -1042,6 +1075,7 @@ static void MPU6050_CalibrateGyro(
 
     }
 
+    mpu->gyro_samples = successful_samples;
 }
 
 /* ============================================================
@@ -1050,7 +1084,7 @@ static void MPU6050_CalibrateGyro(
 
  * ============================================================ */
 
-static void MPU6050_Update(
+static uint8_t MPU6050_Update(
 
     MPU6050_t *mpu
 
@@ -1062,7 +1096,7 @@ static void MPU6050_Update(
 
     {
 
-        return;
+        return 0U;
 
     }
 
@@ -1084,17 +1118,21 @@ static void MPU6050_Update(
 
             14,
 
-            100
+            5 /* Bound the polling timeout during the 5 ms IMU period. */
 
         );
 
+    mpu->read_status = status;
     if (status != HAL_OK)
 
     {
 
-        return;
+        mpu->read_failures++;
+        return 0U;
 
     }
+
+    mpu->read_count++;
 
     /* Accelerometer */
 
@@ -1342,9 +1380,9 @@ static void MPU6050_Update(
 
         {
 
-            dt =
-
-                0.005f;
+            /* After a gap, re-seed instead of integrating a fictional 5 ms. */
+            mpu->filter_initialized = 0U;
+            dt = 0.005f;
 
         }
 
@@ -1462,6 +1500,7 @@ static void MPU6050_Update(
 
     }
 
+    return 1U;
 }
 
 /* ============================================================
@@ -1544,17 +1583,7 @@ static void MPU6050_CalibrateReference(
 
     {
 
-        MPU6050_Update(
-
-            mpu
-
-        );
-
-        if (
-
-            mpu->filter_initialized
-
-        )
+        if (MPU6050_Update(mpu))
 
         {
 
@@ -1592,6 +1621,7 @@ static void MPU6050_CalibrateReference(
 
     }
 
+    mpu->reference_samples = samples;
 }
 
 /* ============================================================
@@ -1605,23 +1635,14 @@ static void MPU6050_CalibrateReference(
  * ============================================================ */
 
 void App_IMU_TaskStep(void)
-
 {
-
-    MPU6050_Update(
-
-        &mpu1
-
-    );
-
-    MPU6050_Update(
-
-        &mpu2
-
-    );
-
+    uint32_t start = HAL_GetTick();
+    /* Read handle first so the carriage sample is newest for control.
+     * Existing timeout/overrun diagnostics must be checked with both buses active. */
+    MPU6050_Update(&mpu1);
+    MPU6050_Update(&mpu2);
+    imu_step_ms = HAL_GetTick() - start;
     imu_task_count++;
-
 }
 
 /* ============================================================
@@ -1636,6 +1657,10 @@ void App_IMU_TaskStep(void)
 
 void App_Control_TaskStep(void)
 {
+    static uint32_t last_control_ms;
+    uint32_t now = HAL_GetTick();
+    control_period_ms = now - last_control_ms;
+    last_control_ms = now;
     /*
      * Servo 1 is held at center while Servo 2 is tuned.
      */
@@ -1649,6 +1674,7 @@ void App_Control_TaskStep(void)
         Servo2_Stabilization_Update();
     }
 
+    servo2_ccr3 = __HAL_TIM_GET_COMPARE(&htim3, TIM_CHANNEL_3);
     control_task_count++;
 }
 

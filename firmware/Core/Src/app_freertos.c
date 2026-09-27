@@ -38,6 +38,9 @@ void StartControlTask(void *argument);
 osThreadId_t imuTaskHandle;
 osThreadId_t controlTaskHandle;
 
+volatile uint32_t imu_deadline_misses = 0;
+volatile uint32_t control_deadline_misses = 0;
+
 
 /* -------------------------------------------------------------------------- */
 /* IMU TASK CONFIGURATION                                                     */
@@ -144,6 +147,12 @@ void StartImuTask(void *argument)
          * in main.c.
          */
         App_IMU_TaskStep();
+        /* A timeout must not leave this higher-priority task spinning to catch up. */
+        if ((TickType_t)(xTaskGetTickCount() - lastWakeTime) >= pdMS_TO_TICKS(5))
+        {
+            imu_deadline_misses++;
+            lastWakeTime = xTaskGetTickCount();
+        }
 
 
         /*
@@ -190,6 +199,12 @@ void StartControlTask(void *argument)
          * implemented in main.c.
          */
         App_Control_TaskStep();
+        /* Skip missed releases instead of issuing a burst of old control cycles. */
+        if ((TickType_t)(xTaskGetTickCount() - lastWakeTime) >= pdMS_TO_TICKS(10))
+        {
+            control_deadline_misses++;
+            lastWakeTime = xTaskGetTickCount();
+        }
 
 
         /*
