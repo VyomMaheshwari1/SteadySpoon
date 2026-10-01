@@ -64,11 +64,13 @@
 
 #define SERVO2_MAX_US             2000U
 
-#define SERVO2_GAIN               7.5f /* Controlled P-only trial; previous gain 5.0f. */
+#define SERVO2_RESPONSE_TEST      0U /* Normal stabilization; identification test disabled. */
+
+#define SERVO2_GAIN               2.0f /* Conservative unvalidated damped-controller bench setting. */
 #define SERVO2_MAX_SAMPLE_AGE_MS  20U
-#define SERVO2_KI_US_PER_DEG_S    2.0f /* Initial bench setting, not a validated tune. */
-#define SERVO2_I_RATE_US_PER_S   20.0f
-#define SERVO2_I_LIMIT_US        350.0f
+#define SERVO2_KI_US_PER_DEG_S    1.0f
+#define SERVO2_I_RATE_US_PER_S   10.0f
+#define SERVO2_I_LIMIT_US        150.0f
 #define SERVO2_SAFE_MIN_US        1150.0f
 #define SERVO2_SAFE_MAX_US        1850.0f
 
@@ -209,9 +211,14 @@ volatile float servo2_error = 0.0f;
 
 volatile float servo2_correction = 0.0f;
 volatile float servo2_command_us_f = 1500.0f;
-/* Diagnostic baseline: 1 holds Servo 2 at center; 0 enables existing PI.
- * This build starts with PI enabled for the secured-motor retest. */
-volatile uint32_t servo2_hold_center_test = 0U;
+/* Diagnostic baseline: 1 holds Servo 2 at center; 0 enables stabilization.
+ * This build starts with feedback disabled; explicit bench arming is required. */
+volatile uint32_t servo2_hold_center_test = 1U; /* Feedback disabled at boot after observed oscillation. */
+/* Faults latch until reboot: 1 sensor invalid, 2 timing, 3 gyro clipping,
+ * 4 repeated high-rate reversals. Fault holds last PWM, not a motor power cut. */
+volatile uint32_t servo2_control_fault;
+volatile float servo2_roll_rate_dps, servo2_d_term_us;
+
 volatile float servo2_integral_us = 0.0f; /* Signed PWM offset, retained near zero error. */
 volatile float servo2_p_term_us = 0.0f;
 volatile float servo2_control_dt_s = 0.0f;
@@ -234,6 +241,31 @@ volatile uint32_t imu_step_ms, control_period_ms;
 volatile HAL_StatusTypeDef servo1_pwm_status;
 
 volatile HAL_StatusTypeDef servo2_pwm_status;
+
+/* Startup-only diagnostics. Stage: 1 identity, 2 wake, 3 DLPF,
+ * 4 gyro range, 5 accel range, 6 initialized. A successful retry preserves
+ * last_failed_* so a transient failure is not hidden by later runtime reads.
+ * HAL status: 0 OK, 1 ERROR, 2 BUSY, 3 TIMEOUT. Wrong identity can have status 0. */
+typedef struct {
+    uint32_t attempts;
+    uint32_t stage;
+    HAL_StatusTypeDef status;
+    uint32_t i2c_error;
+    uint32_t last_failed_stage;
+    HAL_StatusTypeDef last_failed_status;
+    uint32_t last_failed_i2c_error;
+    uint32_t last_failed_who_am_i;
+} MPU6050_InitDebug_t;
+volatile MPU6050_InitDebug_t mpu1_startup, mpu2_startup;
+volatile uint32_t mpu1_gyro_samples, mpu1_reference_samples;
+
+/* Response test: 0 countdown, 1 baseline, 2 +50 us, 3 center,
+ * 4 -50 us, 5 center, 6 complete, 7 aborted. Does not rearm until reset.
+ * Fault: 1 invalid sensors, 2 handle moved >3 deg, 3 carriage moved >20 deg,
+ * 4 control gap >50 ms, 5 explicit center-test override. */
+volatile uint32_t servo2_test_state, servo2_test_fault, servo2_test_elapsed_ms;
+
+
 
 /*
 
@@ -635,10 +667,69 @@ static void Servo1_Stabilization_Update(void)
 
  * ============================================================ */
 
+static void Servo2_ResponseTest_Update(uint32_t now)
+{
+    static uint8_t started;
+    static uint32_t boot_ms, phase_start_ms, previous_ms;
+    static float handle_roll, handle_pitch, carriage_roll;
+    uint16_t pulse = SERVO2_CENTER_US;
+    uint32_t gap = now - previous_ms;
+    previous_ms = now;
+    if (!started) { started = 1U; boot_ms = now; }
+    servo2_test_elapsed_ms = now - boot_ms;
+    servo2_integral_us = 0.0f;
+    servo2_p_term_us = 0.0f;
+    servo2_correction = 0.0f;
+    /* Give the operator 30 seconds to start logging. No feedback runs here. */
+    if (servo2_test_state == 0U && servo2_test_elapsed_ms >= 30000U)
+    {
+        if (!mpu1_valid || servo2_inhibit) { servo2_test_fault = 1U; }
+        else
+        {
+            handle_roll = mpu1_relative_roll_deg;
+            handle_pitch = mpu1_relative_pitch_deg;
+            carriage_roll = servo2_relative_angle;
+            phase_start_ms = now;
+            servo2_test_state = 1U;
+        }
+    }
+    if (servo2_test_state >= 1U && servo2_test_state <= 5U)
+    {
+        if (!mpu1_valid || servo2_inhibit) { servo2_test_fault = 1U; }
+        else if (fabsf(mpu1_relative_roll_deg - handle_roll) > 3.0f ||
+                 fabsf(mpu1_relative_pitch_deg - handle_pitch) > 3.0f)
+        { servo2_test_fault = 2U; }
+        else if (fabsf(servo2_relative_angle - carriage_roll) > 20.0f)
+        { servo2_test_fault = 3U; }
+        else if (gap > 50U) { servo2_test_fault = 4U; }
+        else
+        {
+            uint32_t t = now - phase_start_ms;
+            if (t < 2000U) { servo2_test_state = 1U; }
+            else if (t < 3000U) { servo2_test_state = 2U; pulse = 1550U; }
+            else if (t < 5000U) { servo2_test_state = 3U; }
+            else if (t < 6000U) { servo2_test_state = 4U; pulse = 1450U; }
+            else if (t < 8000U) { servo2_test_state = 5U; }
+            else { servo2_test_state = 6U; }
+        }
+    }
+    if (servo2_hold_center_test && servo2_test_state < 6U)
+    { servo2_test_fault = 5U; }
+    if (servo2_test_fault)
+    {
+        servo2_test_state = 7U;
+        pulse = SERVO2_CENTER_US;
+    }
+    servo2_command_us_f = (float)pulse;
+    Servo2_SetPulse(pulse);
+}
+
 static void Servo2_Stabilization_Update(void)
 {
-    static uint32_t previous_ms, previous_sample;
+    static uint32_t previous_ms, previous_sample, reversal_ms, reversals;
     static uint8_t previous_valid;
+    static int rate_sign;
+    static float filtered_rate;
     uint32_t now = HAL_GetTick();
     uint32_t elapsed_ms = now - previous_ms;
     previous_ms = now;
@@ -655,6 +746,8 @@ static void Servo2_Stabilization_Update(void)
     mpu1_read_failures = mpu1.read_failures;
     mpu1_read_status = mpu1.read_status;
     mpu1_who_am_i = mpu1.who_am_i;
+    mpu1_gyro_samples = mpu1.gyro_samples;
+    mpu1_reference_samples = mpu1.reference_samples;
     mpu1_valid = mpu1.ok && mpu1.filter_initialized &&
         mpu1.gyro_samples == 200U && mpu1.reference_samples == 100U &&
         mpu1.read_status == HAL_OK && mpu1.read_count != 0U &&
@@ -680,70 +773,82 @@ static void Servo2_Stabilization_Update(void)
         mpu2.gyro_samples != 200U || mpu2.reference_samples != 100U ||
         mpu2.read_status != HAL_OK || mpu2.read_count == 0U ||
         mpu2_sample_age_ms > SERVO2_MAX_SAMPLE_AGE_MS;
+    float plane = sqrtf(mpu2.accel_x_g * mpu2.accel_x_g + mpu2.accel_z_g * mpu2.accel_z_g);
+    servo2_roll_rate_dps = plane > 0.1f ?
+        (mpu2.accel_z_g * mpu2.gyro_x_dps - mpu2.accel_x_g * mpu2.gyro_z_dps) / plane : 0.0f;
+    if (plane <= 0.1f || !isfinite(servo2_roll_rate_dps) ||
+        !isfinite(mpu2.gyro_x_dps) || !isfinite(mpu2.gyro_y_dps) || !isfinite(mpu2.gyro_z_dps)) { servo2_inhibit = 1U; }
+    uint8_t gyro_clipped = fabsf(mpu2.gyro_x_dps) >= 450.0f ||
+        fabsf(mpu2.gyro_y_dps) >= 450.0f || fabsf(mpu2.gyro_z_dps) >= 450.0f;
     if (lock >= 0) { osKernelRestoreLock(lock); }
 
     servo2_relative_angle = servo2_measured_roll_deg - servo2_reference_roll_deg;
     servo2_error = servo2_relative_angle;
     servo2_saturated = 0U;
     if (!isfinite(servo2_error)) { servo2_inhibit = 1U; }
+
+    if (servo2_control_fault)
+    {
+        servo2_inhibit = 1U;
+        previous_valid = 0U;
+        return; /* Latched: freeze the last command; no automatic restart. */
+    }
     if (servo2_hold_center_test)
     {
-        /* Keep sensing/logging active, but remove feedback action for comparison. */
-        previous_valid = 0U;
-        servo2_integral_us = 0.0f;
-        servo2_p_term_us = 0.0f;
-        servo2_correction = 0.0f;
+        previous_valid = 0U; rate_sign = 0; reversals = 0U; filtered_rate = 0.0f;
+        servo2_integral_us = servo2_p_term_us = servo2_d_term_us = servo2_correction = 0.0f;
         servo2_command_us_f = (float)SERVO2_CENTER_US;
         Servo2_SetPulse(SERVO2_CENTER_US);
         return;
     }
-    if (servo2_inhibit)
+    if (servo2_inhibit) { servo2_control_fault = 1U; return; }
+    if (gyro_clipped) { servo2_control_fault = 3U; servo2_inhibit = 1U; return; }
+    if (previous_valid && (elapsed_ms == 0U || elapsed_ms > 20U))
+    { servo2_control_fault = 2U; servo2_inhibit = 1U; return; }
+    if (previous_valid && mpu2_read_count == previous_sample) { return; }
+    float dt = previous_valid ? elapsed_ms * 0.001f : 0.01f;
+    if (!previous_valid) { filtered_rate = servo2_roll_rate_dps; reversal_ms = now; rate_sign = 0; reversals = 0U; }
+    previous_valid = 1U; previous_sample = mpu2_read_count;
+    servo2_control_dt_s = dt;
+    /* Conservative bench trip: four >100 dps reversals within 0.5 seconds.
+     * May also trip on vigorous hand motion; it is not a tremor classifier. */
+    if (now - reversal_ms > 500U) { reversals = 0U; rate_sign = 0; reversal_ms = now; }
+    int sign = servo2_roll_rate_dps > 100.0f ? 1 : servo2_roll_rate_dps < -100.0f ? -1 : 0;
+    if (sign && sign != rate_sign)
     {
-        /* Hold the last pulse, not an invented correction from stale data. */
-        servo2_correction = 0.0f;
-        previous_valid = 0U;
-        return;
+        if (rate_sign) { ++reversals; }
+        rate_sign = sign;
+        if (reversals >= 4U) { servo2_control_fault = 4U; servo2_inhibit = 1U; return; }
     }
+    filtered_rate += dt / (0.03f + dt) * (servo2_roll_rate_dps - filtered_rate);
     if (fabsf(servo2_error) < ANGLE_DEADBAND_DEG) { servo2_error = 0.0f; }
     servo2_correction = SERVO2_GAIN * servo2_error;
     servo2_p_term_us = SERVO2_DIRECTION * servo2_correction;
-    /* Integrate only a fresh sample over a normal control interval.
-     * Never catch up across startup, a sensor fault, or a scheduling gap. */
-    if (previous_valid && elapsed_ms > 0U && elapsed_ms <= 20U &&
-        mpu2_read_count != previous_sample)
-    {
-        servo2_control_dt_s = (float)elapsed_ms * 0.001f;
-        float rate = SERVO2_DIRECTION * SERVO2_KI_US_PER_DEG_S * servo2_error;
-        if (rate > SERVO2_I_RATE_US_PER_S) { rate = SERVO2_I_RATE_US_PER_S; }
-        if (rate < -SERVO2_I_RATE_US_PER_S) { rate = -SERVO2_I_RATE_US_PER_S; }
-        float delta = rate * servo2_control_dt_s;
-        float candidate = servo2_integral_us + delta;
-        if (candidate > SERVO2_I_LIMIT_US) { candidate = SERVO2_I_LIMIT_US; }
-        if (candidate < -SERVO2_I_LIMIT_US) { candidate = -SERVO2_I_LIMIT_US; }
-        float proposed = (float)SERVO2_CENTER_US + servo2_p_term_us + candidate;
-        /* Reject accumulation further into saturation; allow unwinding. */
-        if (!((proposed > SERVO2_SAFE_MAX_US && delta > 0.0f) ||
-              (proposed < SERVO2_SAFE_MIN_US && delta < 0.0f)))
-        {
-            servo2_integral_us = candidate;
-        }
-    }
-    previous_valid = 1U;
-    previous_sample = mpu2_read_count;
-    servo2_command_us_f = (float)SERVO2_CENTER_US +
-                          servo2_p_term_us + servo2_integral_us;
-    if (servo2_command_us_f < SERVO2_SAFE_MIN_US)
-    {
-        servo2_command_us_f = SERVO2_SAFE_MIN_US;
-        servo2_saturated = 1U;
-    }
-    if (servo2_command_us_f > SERVO2_SAFE_MAX_US)
-    {
-        servo2_command_us_f = SERVO2_SAFE_MAX_US;
-        servo2_saturated = 1U;
-    }
-    Servo2_SetPulse((uint16_t)(servo2_command_us_f + 0.5f));
+    servo2_d_term_us = SERVO2_DIRECTION * 0.08f * filtered_rate;
+    if (servo2_d_term_us > 20.0f) { servo2_d_term_us = 20.0f; }
+    if (servo2_d_term_us < -20.0f) { servo2_d_term_us = -20.0f; }
+    float rate = SERVO2_DIRECTION * SERVO2_KI_US_PER_DEG_S * servo2_error;
+    if (rate > SERVO2_I_RATE_US_PER_S) { rate = SERVO2_I_RATE_US_PER_S; }
+    if (rate < -SERVO2_I_RATE_US_PER_S) { rate = -SERVO2_I_RATE_US_PER_S; }
+    float delta = rate * dt;
+    float candidate = servo2_integral_us + delta;
+    if (candidate > SERVO2_I_LIMIT_US) { candidate = SERVO2_I_LIMIT_US; }
+    if (candidate < -SERVO2_I_LIMIT_US) { candidate = -SERVO2_I_LIMIT_US; }
+    float proposed = SERVO2_CENTER_US + servo2_p_term_us + servo2_d_term_us + candidate;
+    float step = 600.0f * dt; /* 6 us per nominal control tick. */
+    float previous = (float)servo2_pulse_us;
+    if (!((delta > 0.0f && (proposed > SERVO2_SAFE_MAX_US || proposed > previous + step)) ||
+          (delta < 0.0f && (proposed < SERVO2_SAFE_MIN_US || proposed < previous - step))))
+    { servo2_integral_us = candidate; }
+    proposed = SERVO2_CENTER_US + servo2_p_term_us + servo2_d_term_us + servo2_integral_us;
+    if (proposed < SERVO2_SAFE_MIN_US) { proposed = SERVO2_SAFE_MIN_US; servo2_saturated = 1U; }
+    if (proposed > SERVO2_SAFE_MAX_US) { proposed = SERVO2_SAFE_MAX_US; servo2_saturated = 1U; }
+    if (proposed > previous + step) { proposed = previous + step; }
+    if (proposed < previous - step) { proposed = previous - step; }
+    servo2_command_us_f = proposed;
+    Servo2_SetPulse((uint16_t)(proposed + 0.5f));
 }
+
 
 /* ============================================================
 
@@ -751,9 +856,9 @@ static void Servo2_Stabilization_Update(void)
 
  * ============================================================ */
 
-static void MPU6050_Init(
+static void MPU6050_TryInit(
 
-    MPU6050_t *mpu
+    MPU6050_t *mpu, volatile MPU6050_InitDebug_t *debug
 
 )
 
@@ -769,8 +874,12 @@ static void MPU6050_Init(
 
     HAL_StatusTypeDef status;
 
+    mpu->ok = 0U;
+    mpu->who_am_i = 0U;
+
     /* Check MPU identity. */
 
+    debug->stage = 1U;
     status = HAL_I2C_Mem_Read(
 
         mpu->i2c,
@@ -788,12 +897,14 @@ static void MPU6050_Init(
         100
 
     );
+    debug->status = status;
+    debug->i2c_error = mpu->i2c->ErrorCode;
 
     if (status == HAL_OK && mpu->who_am_i == 0x68)
 
     {
 
-        mpu->ok = 1;
+        /* Identity accepted; ok is set only after all configuration succeeds. */
 
     }
 
@@ -809,6 +920,7 @@ static void MPU6050_Init(
 
     /* Wake MPU6050. */
 
+    debug->stage = 2U;
     status = HAL_I2C_Mem_Write(
 
         mpu->i2c,
@@ -826,6 +938,8 @@ static void MPU6050_Init(
         100
 
     );
+    debug->status = status;
+    debug->i2c_error = mpu->i2c->ErrorCode;
 
     if (status != HAL_OK)
 
@@ -841,6 +955,7 @@ static void MPU6050_Init(
 
     /* Configure the MPU6050 hardware digital low pass filter. */
 
+    debug->stage = 3U;
     status = HAL_I2C_Mem_Write(
 
         mpu->i2c,
@@ -858,6 +973,8 @@ static void MPU6050_Init(
         100
 
     );
+    debug->status = status;
+    debug->i2c_error = mpu->i2c->ErrorCode;
 
     if (status != HAL_OK)
 
@@ -871,6 +988,7 @@ static void MPU6050_Init(
 
     /* Configure gyroscope. */
 
+    debug->stage = 4U;
     status = HAL_I2C_Mem_Write(
 
         mpu->i2c,
@@ -888,6 +1006,8 @@ static void MPU6050_Init(
         100
 
     );
+    debug->status = status;
+    debug->i2c_error = mpu->i2c->ErrorCode;
 
     if (status != HAL_OK)
 
@@ -901,6 +1021,7 @@ static void MPU6050_Init(
 
     /* Configure accelerometer. */
 
+    debug->stage = 5U;
     status = HAL_I2C_Mem_Write(
 
         mpu->i2c,
@@ -918,6 +1039,8 @@ static void MPU6050_Init(
         100
 
     );
+    debug->status = status;
+    debug->i2c_error = mpu->i2c->ErrorCode;
 
     if (status != HAL_OK)
 
@@ -930,8 +1053,92 @@ static void MPU6050_Init(
     }
 
     HAL_Delay(100);
-
+    mpu->ok = 1U;
+    debug->stage = 6U;
 }
+
+/* Startup only: release a slave stranded mid-byte without driving a line high.
+ * result: 1 clear, 2 SCL held low, 3 SDA held low, 4 peripheral restore failed. */
+typedef struct { uint32_t attempts, pulses, result; } MPU6050_BusDebug_t;
+volatile MPU6050_BusDebug_t mpu1_bus_recovery, mpu2_bus_recovery;
+
+static uint8_t MPU6050_ClearBus(MPU6050_t *mpu)
+{
+    volatile MPU6050_BusDebug_t *d =
+        (mpu == &mpu1) ? &mpu1_bus_recovery : &mpu2_bus_recovery;
+    GPIO_TypeDef *scl_port = GPIOA;
+    GPIO_TypeDef *sda_port = (mpu == &mpu1) ? GPIOB : GPIOA;
+    uint16_t scl = (mpu == &mpu1) ? GPIO_PIN_15 : GPIO_PIN_9;
+    uint16_t sda = (mpu == &mpu1) ? GPIO_PIN_7 : GPIO_PIN_8;
+    GPIO_InitTypeDef pins = {0};
+    ++d->attempts; d->pulses = 0U; d->result = 0U;
+    if (HAL_I2C_DeInit(mpu->i2c) != HAL_OK) { d->result = 4U; return 0U; }
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    /* Preload released levels before switching to open-drain GPIO. */
+    HAL_GPIO_WritePin(scl_port, scl, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(sda_port, sda, GPIO_PIN_SET);
+    pins.Mode = GPIO_MODE_OUTPUT_OD; pins.Pull = GPIO_NOPULL;
+    pins.Speed = GPIO_SPEED_FREQ_LOW;
+    pins.Pin = scl; HAL_GPIO_Init(scl_port, &pins);
+    pins.Pin = sda; HAL_GPIO_Init(sda_port, &pins);
+    HAL_Delay(1);
+    if (HAL_GPIO_ReadPin(scl_port, scl) == GPIO_PIN_RESET) { d->result = 2U; }
+    while (!d->result && HAL_GPIO_ReadPin(sda_port, sda) == GPIO_PIN_RESET && d->pulses < 9U)
+    {
+        HAL_GPIO_WritePin(scl_port, scl, GPIO_PIN_RESET); HAL_Delay(1);
+        HAL_GPIO_WritePin(scl_port, scl, GPIO_PIN_SET); HAL_Delay(1);
+        ++d->pulses;
+        if (HAL_GPIO_ReadPin(scl_port, scl) == GPIO_PIN_RESET) { d->result = 2U; }
+    }
+    if (!d->result)
+    {
+        /* STOP: release SDA while SCL is high. */
+        HAL_GPIO_WritePin(scl_port, scl, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(sda_port, sda, GPIO_PIN_RESET); HAL_Delay(1);
+        HAL_GPIO_WritePin(scl_port, scl, GPIO_PIN_SET); HAL_Delay(1);
+        if (HAL_GPIO_ReadPin(scl_port, scl) == GPIO_PIN_RESET) { d->result = 2U; }
+        HAL_GPIO_WritePin(sda_port, sda, GPIO_PIN_SET); HAL_Delay(1);
+        if (!d->result) { d->result = HAL_GPIO_ReadPin(sda_port, sda) == GPIO_PIN_SET ? 1U : 3U; }
+    }
+    /* Always release both pins and restore the original alternate-function bus. */
+    HAL_GPIO_WritePin(scl_port, scl, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(sda_port, sda, GPIO_PIN_SET);
+    if (HAL_I2C_Init(mpu->i2c) != HAL_OK ||
+        HAL_I2CEx_ConfigAnalogFilter(mpu->i2c, I2C_ANALOGFILTER_ENABLE) != HAL_OK ||
+        HAL_I2CEx_ConfigDigitalFilter(mpu->i2c, 0U) != HAL_OK) { d->result = 4U; }
+    return d->result == 1U;
+}
+
+static void MPU6050_Init(MPU6050_t *mpu)
+{
+    volatile MPU6050_InitDebug_t *debug =
+        (mpu == &mpu1) ? &mpu1_startup : &mpu2_startup;
+    *debug = (MPU6050_InitDebug_t){0};
+    /* Allow sensor power to settle, then retry only before the scheduler starts.
+     * Do not recalibrate or introduce blocking recovery in the running loop. */
+    HAL_Delay(100);
+    for (uint32_t attempt = 1U; attempt <= 3U; ++attempt)
+    {
+        debug->attempts = attempt;
+        MPU6050_TryInit(mpu, debug);
+        if (mpu->ok) { return; }
+        debug->last_failed_stage = debug->stage;
+        debug->last_failed_status = debug->status;
+        debug->last_failed_i2c_error = debug->i2c_error;
+        debug->last_failed_who_am_i = mpu->who_am_i;
+        if (attempt < 3U)
+        {
+            if ((debug->i2c_error & (HAL_I2C_ERROR_TIMEOUT | HAL_I2C_ERROR_ARLO | HAL_I2C_ERROR_BERR)) ||
+                debug->status == HAL_BUSY)
+            {
+                if (!MPU6050_ClearBus(mpu)) { return; }
+            }
+            HAL_Delay(50);
+        }
+    }
+}
+
 
 /* ============================================================
 
@@ -1404,6 +1611,19 @@ static uint8_t MPU6050_Update(
 
      */
 
+    /* These are bounded accelerometer tilt angles, not full Euler angles.
+     * Differentiate their definitions using dg/dt = -omega cross g.
+     * Using raw gx/gy directly reverses the fast estimate when az is negative.
+     * Keep the existing static angle convention and servo feedback direction. */
+    const float roll_plane = sqrtf(mpu->accel_x_g * mpu->accel_x_g +
+                                   mpu->accel_z_g * mpu->accel_z_g);
+    const float pitch_plane = sqrtf(mpu->accel_y_g * mpu->accel_y_g +
+                                    mpu->accel_z_g * mpu->accel_z_g);
+    const float roll_tilt_rate = roll_plane > 0.1f ?
+        (mpu->accel_z_g * mpu->gyro_x_dps - mpu->accel_x_g * mpu->gyro_z_dps) / roll_plane : 0.0f;
+    const float pitch_tilt_rate = pitch_plane > 0.1f ?
+        (mpu->accel_z_g * mpu->gyro_y_dps - mpu->accel_y_g * mpu->gyro_z_dps) / pitch_plane : 0.0f;
+
     const float alpha =
 
         0.98f;
@@ -1444,7 +1664,7 @@ static uint8_t MPU6050_Update(
 
                 (
 
-                    mpu->gyro_y_dps *
+                    pitch_tilt_rate *
 
                     dt
 
@@ -1476,7 +1696,7 @@ static uint8_t MPU6050_Update(
 
                 (
 
-                    mpu->gyro_x_dps *
+                    roll_tilt_rate *
 
                     dt
 
@@ -2336,7 +2556,7 @@ static void MX_TIM3_Init(void)
 
     htim3.Init.Period =
 
-        19999;
+        3002; /* 1 MHz / 3003 = 333 Hz; DS215MG V8.0 only. */
 
     htim3.Init.ClockDivision =
 
