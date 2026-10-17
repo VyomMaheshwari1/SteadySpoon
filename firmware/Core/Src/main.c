@@ -64,7 +64,7 @@
 
 #define SERVO2_MAX_US             2000U
 
-#define SERVO2_RESPONSE_TEST      0U /* Normal stabilization; identification test disabled. */
+#define SERVO2_RESPONSE_TEST      0U /* Legacy automatic test disabled. Bench request is separate. */
 
 #define SERVO2_GAIN               2.0f /* Conservative unvalidated damped-controller bench setting. */
 #define SERVO2_MAX_SAMPLE_AGE_MS  20U
@@ -259,11 +259,9 @@ typedef struct {
 volatile MPU6050_InitDebug_t mpu1_startup, mpu2_startup;
 volatile uint32_t mpu1_gyro_samples, mpu1_reference_samples;
 
-/* Response test: 0 countdown, 1 baseline, 2 +50 us, 3 center,
- * 4 -50 us, 5 center, 6 complete, 7 aborted. Does not rearm until reset.
- * Fault: 1 invalid sensors, 2 handle moved >3 deg, 3 carriage moved >20 deg,
- * 4 control gap >50 ms, 5 explicit center-test override. */
+/* One-shot bench diagnostic; see Servo2_ResponseTest_Update for states/faults. */
 volatile uint32_t servo2_test_state, servo2_test_fault, servo2_test_elapsed_ms;
+volatile uint32_t servo2_test_request = 0U; /* Write 1 once; reset required to repeat. */
 
 
 
@@ -667,72 +665,74 @@ static void Servo1_Stabilization_Update(void)
 
  * ============================================================ */
 
+/* Feedforward bench trial: 0 idle, 1 active, 2 returning, 6 complete, 7 fault.
+ * Explicit request, no automatic arming and no feedback. Fault freezes PWM.
+ * Test faults: 1 sensor, 2 handle outside trial range, 3 carriage movement/rate,
+ * 4 timing, 5 cancellation, 6 invalid request. Reset required after finish. */
 static void Servo2_ResponseTest_Update(uint32_t now)
 {
-    static uint8_t started;
-    static uint32_t boot_ms, phase_start_ms, previous_ms;
-    static float handle_roll, handle_pitch, carriage_roll;
-    uint16_t pulse = SERVO2_CENTER_US;
-    uint32_t gap = now - previous_ms;
-    previous_ms = now;
-    if (!started) { started = 1U; boot_ms = now; }
-    servo2_test_elapsed_ms = now - boot_ms;
-    servo2_integral_us = 0.0f;
-    servo2_p_term_us = 0.0f;
-    servo2_correction = 0.0f;
-    /* Give the operator 30 seconds to start logging. No feedback runs here. */
-    if (servo2_test_state == 0U && servo2_test_elapsed_ms >= 30000U)
+    static uint32_t start_ms, previous_ms;
+    static float handle_roll, handle_pitch, carriage_roll, command;
+    servo2_integral_us = servo2_p_term_us = servo2_d_term_us = servo2_correction = 0.0f;
+    if (servo2_test_state == 6U || servo2_test_state == 7U)
     {
-        if (!mpu1_valid || servo2_inhibit) { servo2_test_fault = 1U; }
-        else
-        {
-            handle_roll = mpu1_relative_roll_deg;
-            handle_pitch = mpu1_relative_pitch_deg;
-            carriage_roll = servo2_relative_angle;
-            phase_start_ms = now;
-            servo2_test_state = 1U;
-        }
+        servo2_test_request = 0U;
+        if (servo2_test_state == 7U) { servo2_inhibit = 1U; }
+        return;
     }
-    if (servo2_test_state >= 1U && servo2_test_state <= 5U)
+    if (servo2_test_state == 0U && servo2_test_request == 0U)
     {
-        if (!mpu1_valid || servo2_inhibit) { servo2_test_fault = 1U; }
-        else if (fabsf(mpu1_relative_roll_deg - handle_roll) > 3.0f ||
-                 fabsf(mpu1_relative_pitch_deg - handle_pitch) > 3.0f)
-        { servo2_test_fault = 2U; }
-        else if (fabsf(servo2_relative_angle - carriage_roll) > 20.0f)
+        Servo2_SetPulse(SERVO2_CENTER_US);
+        servo2_command_us_f = SERVO2_CENTER_US;
+        return;
+    }
+    if (servo2_test_request != 1U) { servo2_test_fault = servo2_test_request ? 6U : 5U; }
+    if (!mpu1_valid || servo2_inhibit) { servo2_test_fault = 1U; }
+    if (servo2_test_state == 0U && !servo2_test_fault)
+    {
+        handle_roll = mpu1_relative_roll_deg; handle_pitch = mpu1_relative_pitch_deg;
+        carriage_roll = servo2_relative_angle;
+        start_ms = previous_ms = now; command = SERVO2_CENTER_US; servo2_test_state = 1U;
+    }
+    if (!servo2_test_fault)
+    {
+        if (now - previous_ms > 20U) { servo2_test_fault = 4U; }
+        else if (fabsf(mpu1_relative_roll_deg - handle_roll) > 8.0f ||
+                 fabsf(mpu1_relative_pitch_deg - handle_pitch) > 10.0f) { servo2_test_fault = 2U; }
+        else if (fabsf(servo2_relative_angle - carriage_roll) > 8.0f ||
+                 fabsf(mpu2_gyro_x_dps) > 100.0f || fabsf(servo2_roll_rate_dps) > 100.0f)
         { servo2_test_fault = 3U; }
-        else if (gap > 50U) { servo2_test_fault = 4U; }
-        else
-        {
-            uint32_t t = now - phase_start_ms;
-            if (t < 2000U) { servo2_test_state = 1U; }
-            else if (t < 3000U) { servo2_test_state = 2U; pulse = 1550U; }
-            else if (t < 5000U) { servo2_test_state = 3U; }
-            else if (t < 6000U) { servo2_test_state = 4U; pulse = 1450U; }
-            else if (t < 8000U) { servo2_test_state = 5U; }
-            else { servo2_test_state = 6U; }
-        }
     }
-    if (servo2_hold_center_test && servo2_test_state < 6U)
-    { servo2_test_fault = 5U; }
+    uint32_t dt_ms = now - previous_ms;
+    previous_ms = now;
     if (servo2_test_fault)
     {
-        servo2_test_state = 7U;
-        pulse = SERVO2_CENTER_US;
+        servo2_test_state = 7U; servo2_test_request = 0U; servo2_inhibit = 1U;
+        return; /* No centering jump after a fault; external power cut required. */
     }
-    servo2_command_us_f = (float)pulse;
-    Servo2_SetPulse(pulse);
+    uint32_t t = now - start_ms;
+    servo2_test_elapsed_ms = t;
+    /* Measured mounting: handle roll and carriage roll have opposite signs;
+     * increasing PWM increases carriage roll. Initial local mapping ~13 us/deg.
+     * No integral or carriage feedback enters the command. */
+    float handle_delta = mpu1_relative_roll_deg - handle_roll;
+    if (handle_delta > 5.0f) { handle_delta = 5.0f; }
+    if (handle_delta < -5.0f) { handle_delta = -5.0f; }
+    float target = SERVO2_CENTER_US + 13.0f * handle_delta;
+    if (t >= 30000U) { servo2_test_state = 2U; target = SERVO2_CENTER_US; }
+    float step = 0.1f * dt_ms; /* Tested diagnostic ramp: 100 us/s. */
+    if (target > command + step) { command += step; }
+    else if (target < command - step) { command -= step; }
+    else { command = target; }
+    servo2_command_us_f = command;
+    Servo2_SetPulse((uint16_t)(command + 0.5f));
+    if (servo2_test_state == 2U && command == SERVO2_CENTER_US)
+    { servo2_test_state = 6U; servo2_test_request = 0U; }
 }
 
 static void Servo2_Stabilization_Update(void)
 {
-    static uint32_t previous_ms, previous_sample, reversal_ms, reversals;
-    static uint8_t previous_valid;
-    static int rate_sign;
-    static float filtered_rate;
     uint32_t now = HAL_GetTick();
-    uint32_t elapsed_ms = now - previous_ms;
-    previous_ms = now;
     servo2_control_dt_s = 0.0f;
     /* Snapshot while the IMU task cannot preempt us; do not lock over I2C. */
     int32_t lock = osKernelLock();
@@ -787,66 +787,9 @@ static void Servo2_Stabilization_Update(void)
     servo2_saturated = 0U;
     if (!isfinite(servo2_error)) { servo2_inhibit = 1U; }
 
-    if (servo2_control_fault)
-    {
-        servo2_inhibit = 1U;
-        previous_valid = 0U;
-        return; /* Latched: freeze the last command; no automatic restart. */
-    }
-    if (servo2_hold_center_test)
-    {
-        previous_valid = 0U; rate_sign = 0; reversals = 0U; filtered_rate = 0.0f;
-        servo2_integral_us = servo2_p_term_us = servo2_d_term_us = servo2_correction = 0.0f;
-        servo2_command_us_f = (float)SERVO2_CENTER_US;
-        Servo2_SetPulse(SERVO2_CENTER_US);
-        return;
-    }
-    if (servo2_inhibit) { servo2_control_fault = 1U; return; }
-    if (gyro_clipped) { servo2_control_fault = 3U; servo2_inhibit = 1U; return; }
-    if (previous_valid && (elapsed_ms == 0U || elapsed_ms > 20U))
-    { servo2_control_fault = 2U; servo2_inhibit = 1U; return; }
-    if (previous_valid && mpu2_read_count == previous_sample) { return; }
-    float dt = previous_valid ? elapsed_ms * 0.001f : 0.01f;
-    if (!previous_valid) { filtered_rate = servo2_roll_rate_dps; reversal_ms = now; rate_sign = 0; reversals = 0U; }
-    previous_valid = 1U; previous_sample = mpu2_read_count;
-    servo2_control_dt_s = dt;
-    /* Conservative bench trip: four >100 dps reversals within 0.5 seconds.
-     * May also trip on vigorous hand motion; it is not a tremor classifier. */
-    if (now - reversal_ms > 500U) { reversals = 0U; rate_sign = 0; reversal_ms = now; }
-    int sign = servo2_roll_rate_dps > 100.0f ? 1 : servo2_roll_rate_dps < -100.0f ? -1 : 0;
-    if (sign && sign != rate_sign)
-    {
-        if (rate_sign) { ++reversals; }
-        rate_sign = sign;
-        if (reversals >= 4U) { servo2_control_fault = 4U; servo2_inhibit = 1U; return; }
-    }
-    filtered_rate += dt / (0.03f + dt) * (servo2_roll_rate_dps - filtered_rate);
-    if (fabsf(servo2_error) < ANGLE_DEADBAND_DEG) { servo2_error = 0.0f; }
-    servo2_correction = SERVO2_GAIN * servo2_error;
-    servo2_p_term_us = SERVO2_DIRECTION * servo2_correction;
-    servo2_d_term_us = SERVO2_DIRECTION * 0.08f * filtered_rate;
-    if (servo2_d_term_us > 20.0f) { servo2_d_term_us = 20.0f; }
-    if (servo2_d_term_us < -20.0f) { servo2_d_term_us = -20.0f; }
-    float rate = SERVO2_DIRECTION * SERVO2_KI_US_PER_DEG_S * servo2_error;
-    if (rate > SERVO2_I_RATE_US_PER_S) { rate = SERVO2_I_RATE_US_PER_S; }
-    if (rate < -SERVO2_I_RATE_US_PER_S) { rate = -SERVO2_I_RATE_US_PER_S; }
-    float delta = rate * dt;
-    float candidate = servo2_integral_us + delta;
-    if (candidate > SERVO2_I_LIMIT_US) { candidate = SERVO2_I_LIMIT_US; }
-    if (candidate < -SERVO2_I_LIMIT_US) { candidate = -SERVO2_I_LIMIT_US; }
-    float proposed = SERVO2_CENTER_US + servo2_p_term_us + servo2_d_term_us + candidate;
-    float step = 600.0f * dt; /* 6 us per nominal control tick. */
-    float previous = (float)servo2_pulse_us;
-    if (!((delta > 0.0f && (proposed > SERVO2_SAFE_MAX_US || proposed > previous + step)) ||
-          (delta < 0.0f && (proposed < SERVO2_SAFE_MIN_US || proposed < previous - step))))
-    { servo2_integral_us = candidate; }
-    proposed = SERVO2_CENTER_US + servo2_p_term_us + servo2_d_term_us + servo2_integral_us;
-    if (proposed < SERVO2_SAFE_MIN_US) { proposed = SERVO2_SAFE_MIN_US; servo2_saturated = 1U; }
-    if (proposed > SERVO2_SAFE_MAX_US) { proposed = SERVO2_SAFE_MAX_US; servo2_saturated = 1U; }
-    if (proposed > previous + step) { proposed = previous + step; }
-    if (proposed < previous - step) { proposed = previous - step; }
-    servo2_command_us_f = proposed;
-    Servo2_SetPulse((uint16_t)(proposed + 0.5f));
+    /* Explicitly armed feedforward bench build; old PID is unreachable. */
+    if (gyro_clipped) { servo2_inhibit = 1U; }
+    Servo2_ResponseTest_Update(now);
 }
 
 

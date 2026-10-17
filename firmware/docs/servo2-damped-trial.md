@@ -1,37 +1,21 @@
-# Servo 2 damped controller trial
+# Servo 2 handle feedforward bench trial
 
-This revision is an unvalidated bench controller. It starts with Servo 2 held at 1500 us and Servo 1 centered. Physical stabilization performance has not been demonstrated. Do not mistake hold-center mode for active stabilization.
+The small open-loop +/-20 us diagnostic completed without a fault and the user reported smooth motion. Positive 20 us produced approximately +1.6 degrees carriage roll; negative 20 us about -1.5 degrees. This is a local static calibration, not validated bandwidth or a global linkage map.
 
-## Changes
+Current candidate uses no PID: command = 1500 + 13 * (handle roll - handle roll at arming), in microseconds. Observed handle/carriage signs are opposite; positive PWM increases carriage roll. MPU2 monitors actual carriage movement but does not change the output. This preserves the starting orientation, not automatically gravity-level. Place the spoon level before arming if level is desired.
 
-- Correct gyro-rate projection to match the bounded accelerometer tilt definitions, including inverted sensor mounting.
-- Retry MPU startup with bounded, open-drain I2C bus recovery and retained diagnostics.
-- Use angle gain 2 us/degree, rate damping 0.08 us/(degree/s), and a 30 ms rate filter. Damping is limited to +/-20 us.
-- Use integral gain 1 us/(degree*s), limited to 10 us/s and +/-150 us, with anti-windup.
-- Limit commands to 1150–1850 us and nominal changes to 6 us per 10 ms control tick.
-- Configure Servo 2 TIM3 for approximately 333 Hz PWM with 1 us resolution, for the KST DS215MG V8.0. Servo 1 timing is unchanged.
+Boot is unarmed and commands center. Explicit servo2_test_request=1 captures starting handle/carriage orientation. Handle roll command is clipped to +/-5 degrees (+/-65 us); output ramps at 100 us/s, the same ramp tested in the diagnostic. At 30 seconds it smoothly returns to center (up to 0.65 seconds), then cannot rearm until reset. Servo 1 remains centered. This deliberately slow candidate is for validating tilt compensation, not claiming tremor suppression.
 
-## Defaults and fault behavior
+State 0 idle, 1 active, 2 returning to center, 6 complete, 7 fault. Fault 1 sensor invalid, 2 handle roll exceeds +/-8 degrees or pitch exceeds +/-10 degrees from arming, 3 carriage exceeds +/-8 degrees or observed carriage X/projected roll rate exceeds 100 degrees/s, 4 scheduling gap exceeds 20 ms, 5 request cleared while active, 6 invalid request. Any fault freezes the last PWM, not a motor power cut. Cut external servo power on a jerk or fault. Reset required to repeat. The old hold-center flag does not arm or disarm this build; use the request and state fields.
 
-`servo2_hold_center_test` defaults to 1. Enabling feedback requires an explicit, supervised bench action. Automatic actuator testing is disabled.
+Firmware source and ELF for the successful prior diagnostic are archived in the task workspace outputs/handle-feedforward/diagnostic-before.*. Refresh monitor symbols from the newly flashed ELF. Verify physical improvement by comparing carriage angle change against handle angle change while holding a small tilt; no source-code test proves the linkage calibration, axis mapping or actual stabilization.
 
-`servo2_control_fault` latches until reset:
+Host tests compile actual firmware functions and exercise no automatic arming, both command directions, limits and nominal slew, timed return, no repeat arming, clock wrap, sensor faults, motion/rate bounds, timing faults, cancellation and malformed requests.
 
-| Code | Trigger |
-|---|---|
-| 1 | Invalid, stale, nonfinite, or singular-coordinate sensor data |
-| 2 | Active control interval outside the permitted timing window |
-| 3 | Any carriage gyro axis reaches 450 degrees/second |
-| 4 | Four rate reversals exceeding +/-100 degrees/second within 500 ms |
+The temporary cross-axis pitch allowance was widened from 2 to 10 degrees after hand-held tests repeatedly aborted on small coupled movements. This does not enable a second controlled axis or validate compensation at large pitch angles. Host cases check acceptance at +/-10 degrees and a latched abort beyond the allowance.
 
-A fault freezes the last PWM command. It does **not** disconnect motor power. The oscillation guard can also trip on vigorous imposed motion; it is not a tremor classifier. Reset returns to hold-center mode.
+## Measured trial on October 16, 2026
 
-Keep external servo power off when flashing. Refresh CubeMonitor variable addresses from the exact newly flashed ELF; rebuilding can move globals. Never use a stale zero-valued graph as evidence of stabilization. Include fault, inhibit, hold-center and sensor-health fields in subsequent recordings.
+The 30-second trial completed at state 6, fault 0, request 0 and 1500 us. In the moving interval (2 to 12 seconds after first observed active sample), handle angular standard deviation was 1.756 degrees and carriage standard deviation was 1.168 degrees, a 33.5 percent reduction relative to handle variation. Peak-to-peak ranges were 7.875 and 5.633 degrees respectively. This is an input/output comparison, not attenuation against a matched disabled-controller trial. During the quiet interval from 14 to 29 seconds, carriage standard deviation was 0.0179 degrees.
 
-## Validation
-
-ARM firmware build passed. Eleven isolated host tests exercise the actual controller functions: startup hold, command slew/integral limits, damping direction and decay, clipping/reversal latches, timing, stale data, anti-windup, timer wrap, duplicate samples and nonfinite input. Run `python firmware/tests/test_servo2_controller.py` with a host GCC compiler installed (`CC` can select it).
-
-Replay of a prior unstable recording triggered the reversal guard and held the output. Replay verifies response to recorded inputs, not new closed-loop physical behavior. Hardware validation is still required. Known build warnings concern unused Servo 1 stabilization and the legacy automatic-response helper.
-
-Reference: [KST DS215MG V8.0 specification](https://www.kst-servo-shop.de/media/9b/d5/38/1751020226/KST_0821_DS215MG_V8_Datenblatt_04_2025_de.pdf).
+The host recording median interval was approximately 0.193 seconds (5.17 Hz). It cannot validate tremor-frequency suppression, peak gyro speed, or accurate control latency. Commands frequently approached the configured 100 us/s limit. A future speed-limit change must be compared using the same small input amplitude and rate before increasing imposed movement frequency. Both-axis stabilization and fast-shaking performance remain unvalidated.

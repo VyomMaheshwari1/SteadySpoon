@@ -8,29 +8,38 @@ static int32_t osKernelRestoreLock(int32_t x){return x;}
 def fn(n):
  m=re.search(r'(?m)^static void '+n+r'\([^;]*?\)\s*\{',s);return s[m.start():s.index('\n}',m.end())+2]
 t=r'''
-static void sample(float angle,float rate){
+static void sample(void){
  tick+=10;mpu2.ok=mpu2.filter_initialized=1;mpu2.gyro_samples=200;mpu2.reference_samples=100;
  mpu2.read_status=HAL_OK;mpu2.read_count++;mpu2.last_update_ms=tick;
- mpu2.roll_filtered_deg=angle;mpu2.roll_reference_deg=0;mpu2.accel_x_g=0;mpu2.accel_z_g=-1;
- mpu2.gyro_x_dps=-rate;mpu2.gyro_y_dps=mpu2.gyro_z_dps=0;
+ mpu2.roll_filtered_deg=0;mpu2.roll_reference_deg=0;mpu2.accel_x_g=0;mpu2.accel_z_g=-1;
+ mpu2.gyro_x_dps=mpu2.gyro_y_dps=mpu2.gyro_z_dps=0;
+ mpu1=mpu2;
 }
 int main(int argc,char **argv){
- int mode=argc>1?atoi(argv[1]):0;assert(servo2_hold_center_test==1);
- if(mode==0){for(int i=0;i<1000;i++){sample(i%2?45:-45,i%2?490:-490);Servo2_Stabilization_Update();assert(servo2_pulse_us==1500&&!servo2_control_fault);}return 0;}
- servo2_hold_center_test=0;
- if(mode==1){unsigned last=1500;for(int i=0;i<500;i++){sample(10,0);Servo2_Stabilization_Update();assert(!servo2_control_fault&&abs((int)servo2_pulse_us-(int)last)<=6);last=servo2_pulse_us;assert(fabsf(servo2_integral_us)<=150);}assert(servo2_integral_us< -40&&servo2_pulse_us<1460);}
- if(mode==2){sample(0,50);Servo2_Stabilization_Update();assert(servo2_d_term_us<0&&servo2_pulse_us<1500);for(int i=0;i<100;i++){sample(0,0);Servo2_Stabilization_Update();}assert(servo2_pulse_us==1500);}
- if(mode==3){sample(0,451);Servo2_Stabilization_Update();assert(servo2_control_fault==3&&servo2_pulse_us==1500);servo2_hold_center_test=1;sample(0,0);Servo2_Stabilization_Update();assert(servo2_control_fault==3);}
- if(mode==4){for(int i=0;i<25;i++){sample(0,(i/4)%2?150:-150);Servo2_Stabilization_Update();}assert(servo2_control_fault==4);unsigned last=servo2_pulse_us;sample(20,0);Servo2_Stabilization_Update();assert(servo2_pulse_us==last);}
- if(mode==5){sample(0,0);Servo2_Stabilization_Update();tick+=100;sample(0,0);Servo2_Stabilization_Update();assert(servo2_control_fault==2);}
- if(mode==6){sample(0,0);mpu2.last_update_ms=tick-21;Servo2_Stabilization_Update();assert(servo2_control_fault==1);}
- if(mode==7){for(int i=0;i<2000;i++){sample(200,0);Servo2_Stabilization_Update();assert(servo2_pulse_us>=1150&&servo2_pulse_us<=1850);assert(fabsf(servo2_integral_us)<.01f);}assert(servo2_pulse_us==1150&&servo2_saturated);}
- if(mode==8){tick=0xffffffe0U;for(int i=0;i<10;i++){sample(-10,0);Servo2_Stabilization_Update();assert(!servo2_control_fault&&servo2_pulse_us>=1500);}}
- if(mode==9){sample(10,0);Servo2_Stabilization_Update();float integral=servo2_integral_us;unsigned pulse=servo2_pulse_us;tick+=10;Servo2_Stabilization_Update();assert(servo2_integral_us==integral&&servo2_pulse_us==pulse);}
- if(mode==10){sample(NAN,0);Servo2_Stabilization_Update();assert(servo2_control_fault==1);}
- puts("PASS controller case");
+ int mode=argc>1?atoi(argv[1]):0;
+ if(mode==0){for(int i=0;i<1000;i++){sample();servo2_hold_center_test=i%2;Servo2_Stabilization_Update();assert(servo2_pulse_us==1500&&servo2_test_state==0&&servo2_integral_us==0);}return 0;}
+ if(mode==8)tick=0xfffff000U;
+ sample();if(mode==11)mpu1.roll_filtered_deg=4;servo2_test_request=1;Servo2_Stabilization_Update();assert(servo2_test_state==1);
+ if(mode==11){assert(servo2_pulse_us==1500);for(int i=0;i<50;i++){sample();mpu1.roll_filtered_deg=5;Servo2_Stabilization_Update();}assert(servo2_pulse_us==1513);return 0;}
+ if(mode==12){for(int i=0;i<100;i++){sample();mpu1.pitch_filtered_deg=i%2?10.0f:-10.0f;Servo2_Stabilization_Update();assert(!servo2_test_fault&&servo2_pulse_us==1500);}return 0;}
+ if(mode==1||mode==8){unsigned last=1500,low=1500,high=1500;for(int i=0;i<3100;i++){sample();mpu1.roll_filtered_deg=i<500?6:-6;Servo2_Stabilization_Update();assert(!servo2_test_fault);assert(abs((int)servo2_pulse_us-(int)last)<=1);last=servo2_pulse_us;if(last<low)low=last;if(last>high)high=last;assert(servo2_integral_us==0);}assert(low==1435&&high==1565&&last==1500&&servo2_test_state==6);servo2_test_request=1;sample();Servo2_Stabilization_Update();assert(servo2_test_request==0&&servo2_test_state==6);return 0;}
+ for(int i=0;i<100;i++){sample();mpu1.roll_filtered_deg=3;Servo2_Stabilization_Update();}unsigned last=servo2_pulse_us;assert(last==1539);
+ sample();
+ if(mode==2)mpu1.roll_filtered_deg=9;
+ if(mode==3)mpu2.last_update_ms=tick-21;
+ if(mode==4)mpu2.gyro_x_dps=101;
+ if(mode==5)tick+=30;
+ if(mode==6)servo2_test_request=0;
+ if(mode==7)mpu2.roll_filtered_deg=NAN;
+ if(mode==9)mpu2.roll_filtered_deg=9;
+ if(mode==10)servo2_test_request=2;
+ if(mode==13)mpu1.pitch_filtered_deg=10.1f;
+ Servo2_Stabilization_Update();assert(servo2_test_state==7&&servo2_test_fault&&servo2_inhibit&&servo2_pulse_us==last);
+ sample();servo2_test_request=1;Servo2_Stabilization_Update();assert(servo2_test_state==7&&servo2_test_request==0&&servo2_pulse_us==last);
+ puts("PASS abort freezes command and prevents rearming");
 }
 '''
+
 compiler = os.environ.get('CC') or shutil.which('gcc') or shutil.which('cc')
 if not compiler and Path('C:/msys64/ucrt64/bin/gcc.exe').exists():
     compiler = 'C:/msys64/ucrt64/bin/gcc.exe'
@@ -39,8 +48,8 @@ if not compiler:
 with tempfile.TemporaryDirectory(prefix='servo2-test-') as folder:
     p = Path(folder) / 'test.c'
     exe = Path(folder) / ('test.exe' if os.name == 'nt' else 'test')
-    p.write_text(stub+prefix+fn('Servo2_SetPulse')+fn('Servo2_Stabilization_Update')+t)
+    p.write_text(stub+prefix+fn('Servo2_SetPulse')+fn('Servo2_ResponseTest_Update')+fn('Servo2_Stabilization_Update')+t)
     subprocess.run([compiler,'-std=c11','-O2','-Wall','-Wextra','-Werror',str(p),'-o',str(exe),'-lm'],check=True)
-    for case in range(11):
+    for case in range(14):
         subprocess.run([str(exe),str(case)],check=True)
-print('PASS all 11 Servo 2 controller cases')
+print('PASS all 14 feedforward bench cases')
